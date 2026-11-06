@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+agent/.env
+agent/config/service_account.json
+agent/config/*.json
+!agent/config/.gitkeep
+
+# Runtime artefacts
+agent/output/*.csv
+agent/output/*.jsonl
+agent/output/*.json
+agent/output/*.md
+agent/output/blasts/
+agent/tmp/
+!agent/output/.gitkeep
+!agent/tmp/.gitkeep
+
+# Generated fixtures are reproducible from _refs/build_dummy.py
+_refs/*.xlsx
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Workbuddy AI
+.workbuddy-ai/

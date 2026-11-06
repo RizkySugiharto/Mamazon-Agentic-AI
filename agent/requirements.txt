@@ -1,0 +1,26 @@
+# Mamazon Spade Office Agent
+# Tencent Cloud Hackathon 2026 - Challenge B
+#
+# Install:  pip install -r agent/requirements.txt
+
+# Core
+openpyxl>=3.1.0            # local xlsx reading/writing
+Pillow>=10.0.0             # image compression before Vision API
+python-dotenv>=1.0.0       # .env loading
+
+# Discord interface
+discord.py>=2.3.0
+
+# HTTP (Drive fallback). The OpenRouter Vision adapter is stdlib-only on purpose.
+# requests>=2.31.0
+
+# Google Drive / Sheets (optional at runtime — mock backend works without it)
+google-api-python-client>=2.100.0
+google-auth>=2.25.0
+google-auth-oauthlib>=1.1.0
+
+# Tencent Hunyuan Vision (optional at runtime — mock backend works without it)
+tencentcloud-sdk-python>=3.0.700
+
+# Tests
+pytest>=8.0.0
