@@ -16,8 +16,14 @@ from src import config
 from src.image_manager import ImageManager
 from src.models import CheckResult, CheckStatus, ResultStatus, Submission, ValidationResult, VisionFacts
 from src.output_generator import OUTPUT_LOCK, OutputGenerator
-from src.rulebase_engine import RulebaseEngine
-from src.validator import DivisionNotFoundError, SheetAmbiguousError, SheetNotFoundError, Validator
+from src.validator import (
+    DivisionNotFoundError,
+    RulebaseEngine,
+    SheetAmbiguousError,
+    SheetNotFoundError,
+    TaskEngineAdapter,
+    Validator,
+)
 from src.vision_checker import MockVision
 
 

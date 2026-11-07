@@ -12,11 +12,18 @@ dependencies = [
     # Google Sheets / Drive
     "google-api-python-client>=2.100.0",
     "google-auth>=2.25.0",
+    "langchain>=1.4.9",
+    "langchain-core>=1.7.6",
+    "langchain-openai>=1.7.4",
+    "langgraph>=1.2.20",
+    "zvec>=0.8.0",
+    "fastembed>=0.9.1",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "duckduckgo_search>=7.0.0",
 ]
 
 [project.optional-dependencies]
-# Tencent Hunyuan Vision is optional — OpenRouter is the default backend.
-tencent = ["tencentcloud-sdk-python>=3.0.700"]
 dev = ["pytest>=8.0.0"]
 
 [project.scripts]

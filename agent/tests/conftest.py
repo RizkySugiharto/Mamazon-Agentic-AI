@@ -18,22 +18,34 @@ from src.drive_client import MockDrive  # noqa: E402
 from src.sheets_client import XlsxSource  # noqa: E402
 from src.image_manager import ImageManager  # noqa: E402
 from src.output_generator import BlastStore, OutputGenerator  # noqa: E402
-from src.rulebase_engine import RulebaseEngine  # noqa: E402
+from src.validator import TaskEngineAdapter, Validator  # noqa: E402
+from src.vision_checker import MockVision  # noqa: E402
+
+
+@pytest.fixture()
+def validator(rulebase, outputs, images) -> Validator:
+    """A Validator wired to the dummy dataset and a mocked vision backend."""
+    data = DataLayer(source=XlsxSource(config.DUMMY_DATA_PATH))
+    instance = Validator(
+        data_layer=data, vision=MockVision(), images=images, outputs=outputs, blast_context={}
+    )
+    yield instance
+    data.close()
 
 
 @pytest.fixture(scope="session")
-def rulebase() -> dict:
-    return json.loads(config.RULEBASE_PATH.read_text(encoding="utf-8"))
+def engine() -> TaskEngineAdapter:
+    return TaskEngineAdapter()
+
+
+@pytest.fixture(scope="session")
+def rulebase(engine) -> dict:
+    return engine.rulebase
 
 
 @pytest.fixture()
-def engine(rulebase) -> RulebaseEngine:
-    return RulebaseEngine(rulebase)
-
-
-@pytest.fixture()
-def data(rulebase) -> DataLayer:
-    layer = DataLayer(rulebase=rulebase, source=XlsxSource(config.DUMMY_DATA_PATH))
+def data() -> DataLayer:
+    layer = DataLayer(source=XlsxSource(config.DUMMY_DATA_PATH))
     yield layer
     layer.close()
 

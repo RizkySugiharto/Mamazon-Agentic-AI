@@ -59,6 +59,33 @@ class TestNewBotFeatures:
         rendered = str(MamazonBot._task_embed(dummy, engine.merge("BZ-02")).to_dict())
         assert "B3" in rendered and "B7" in rendered and "Rabu" in rendered
         assert "Singkatnya" in rendered
+        assert "Channel Tugas" in rendered and ("<#" in rendered or "blast-tugas" in rendered)
+
+    def test_channel_mention_and_generic_ketentuan_embed(self, engine, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock
+        from types import SimpleNamespace
+        from src import config
+        from src.utils import channel_mention
+        from src.discord_bot import MamazonBot
+
+        assert channel_mention("123456789") == "<#123456789>"
+        assert channel_mention(123456789) == "<#123456789>"
+        assert channel_mention("") == "#blast-tugas"
+        assert channel_mention(None) == "#blast-tugas"
+        assert channel_mention("not-a-number") == "#blast-tugas"
+
+        dummy = SimpleNamespace(
+            validator=SimpleNamespace(engine=engine, rulebase=engine.rulebase),
+            guard=AsyncMock(return_value=True),
+        )
+        interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+        monkeypatch.setattr(config, "DISCORD_BLAST_TUGAS_CHANNEL_ID", "999888")
+        asyncio.run(MamazonBot.ketentuan_cmd(dummy, interaction, None, "ketentuan-pp"))
+        embed = interaction.response.send_message.call_args.kwargs["embed"]
+        rendered = str(embed.to_dict())
+        assert "Channel Tugas" in rendered
+        assert "<#999888>" in rendered
 
     def test_task_links_never_fabricate_message_id(self, engine, monkeypatch):
         import asyncio
@@ -223,4 +250,255 @@ class TestNewBotFeatures:
                 pass
             else:
                 raise AssertionError("missing channel must fail")
+        asyncio.run(check())
+
+
+class TestChatActionViewAndDispatch:
+    @staticmethod
+    def _action():
+        return {
+            "command": "validate",
+            "params": {"sheet": "PP 29 Oktober", "divisi": "Spade", "force": False},
+            "description": "Validasi sheet PP 29 Oktober untuk divisi Spade.",
+            "permission": "validate",
+            "mutating": True,
+        }
+
+    @staticmethod
+    def _interaction(user_id: int):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id),
+            message=SimpleNamespace(edit=AsyncMock()),
+            response=SimpleNamespace(
+                send_message=AsyncMock(),
+                defer=AsyncMock(),
+                edit_message=AsyncMock(),
+            ),
+        )
+
+    def test_confirm_wrong_user_is_denied(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.discord_bot import ChatActionView
+
+        async def check():
+            action = self._action()
+            bot = SimpleNamespace(
+                has_permission=Mock(return_value=True),
+                execute_chat_action=AsyncMock(),
+            )
+            view = ChatActionView(bot, action, requester_id=10)
+            interaction = self._interaction(user_id=999)
+
+            await view.confirm.callback(interaction)
+
+            interaction.response.send_message.assert_awaited_once()
+            assert "Hanya peminta" in interaction.response.send_message.call_args.args[0]
+            bot.execute_chat_action.assert_not_called()
+            interaction.message.edit.assert_not_called()
+            interaction.response.defer.assert_not_called()
+
+        asyncio.run(check())
+
+    def test_confirm_correct_user_dispatches_without_defer_and_disables_buttons(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.discord_bot import ChatActionView
+
+        async def check():
+            action = self._action()
+            bot = SimpleNamespace(
+                has_permission=Mock(return_value=True),
+                execute_chat_action=AsyncMock(),
+            )
+            view = ChatActionView(bot, action, requester_id=10)
+            interaction = self._interaction(user_id=10)
+
+            await view.confirm.callback(interaction)
+
+            bot.has_permission.assert_called_once_with(interaction.user, "validate")
+            bot.execute_chat_action.assert_awaited_once_with(interaction, action)
+            # The source message is edited (not the interaction response), so the
+            # dispatched command can still acknowledge the interaction itself.
+            interaction.response.defer.assert_not_called()
+            interaction.message.edit.assert_awaited_once_with(view=None)
+            interaction.response.send_message.assert_not_called()
+
+        asyncio.run(check())
+
+    def test_confirm_rechecks_permission_at_click_time(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.discord_bot import ChatActionView
+
+        async def check():
+            action = self._action()
+            bot = SimpleNamespace(
+                has_permission=Mock(return_value=False),
+                execute_chat_action=AsyncMock(),
+            )
+            view = ChatActionView(bot, action, requester_id=10)
+            interaction = self._interaction(user_id=10)
+
+            await view.confirm.callback(interaction)
+
+            bot.execute_chat_action.assert_not_called()
+            interaction.response.send_message.assert_awaited_once()
+            assert "Role" in interaction.response.send_message.call_args.args[0]
+            interaction.message.edit.assert_not_called()
+
+        asyncio.run(check())
+
+    def test_execute_chat_action_dispatches_validate_and_audits(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.discord_bot import MamazonBot
+
+        async def check():
+            action = self._action()
+            interaction = SimpleNamespace(
+                user=SimpleNamespace(id=10),
+                response=SimpleNamespace(
+                    send_message=AsyncMock(), defer=AsyncMock()
+                ),
+            )
+            dummy = SimpleNamespace(
+                outputs=SimpleNamespace(audit=Mock()),
+                validate_cmd=AsyncMock(),
+                guard=AsyncMock(return_value=True),
+            )
+
+            await MamazonBot.execute_chat_action(dummy, interaction, action)
+
+            dummy.validate_cmd.assert_awaited_once_with(
+                interaction, "PP 29 Oktober", False, "Spade"
+            )
+            audit_kwargs = dummy.outputs.audit.call_args.kwargs
+            assert audit_kwargs["action"] == "chat_command_confirmed"
+            assert audit_kwargs["target"] == "validate"
+            assert audit_kwargs["result"] == "executed"
+            assert audit_kwargs["extra"]["params"] == action["params"]
+            interaction.response.send_message.assert_not_called()
+
+        asyncio.run(check())
+
+
+class TestBlastMessageHandler:
+    def test_unauthorized_user_is_ignored(self):
+        import asyncio
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.discord_bot import MamazonBot
+
+        async def check():
+            bot = SimpleNamespace(
+                has_permission=Mock(return_value=False),
+                processed=set(),
+            )
+            msg = SimpleNamespace(
+                content="BLAST TUGAS PP-05\nDeadline: 28 Oktober 2026 15:00",
+                id=123,
+                author=SimpleNamespace(id=1, bot=False),
+                reply=AsyncMock(),
+                add_reaction=AsyncMock(),
+            )
+            await MamazonBot._handle_blast_message(bot, msg)
+            bot.has_permission.assert_called_once_with(msg.author, "blast")
+            msg.reply.assert_not_called()
+            msg.add_reaction.assert_not_called()
+
+        asyncio.run(check())
+
+    def test_authorized_user_gets_reaction_embed_and_private_dm(self, tmp_path):
+        import asyncio
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.blast_reader import BlastContextStore
+        from src.discord_bot import MamazonBot
+
+        async def check():
+            contexts = BlastContextStore(tmp_path / "ctx.json")
+            bot = SimpleNamespace(
+                has_permission=Mock(return_value=True),
+                processed=set(),
+                contexts=contexts,
+                outputs=SimpleNamespace(audit=Mock()),
+                audit_mirror=AsyncMock(),
+            )
+            author = SimpleNamespace(id=1, bot=False, send=AsyncMock())
+            msg = SimpleNamespace(
+                content="BLAST TUGAS PP-05\nDeadline: 28 Oktober 2026 15:00\nTags: @sponsor_keren",
+                id=123,
+                author=author,
+                channel=SimpleNamespace(name="blast-tugas"),
+                created_at=datetime(2026, 10, 26, 10, 0),
+                reply=AsyncMock(),
+                add_reaction=AsyncMock(),
+            )
+            await MamazonBot._handle_blast_message(bot, msg)
+
+            msg.add_reaction.assert_awaited_once_with("✅")
+            assert msg.reply.call_count == 1
+            reply_kwargs = msg.reply.call_args.kwargs
+            embed = reply_kwargs["embed"]
+            assert embed.title == "Kode Buzzer/Paid Promote: PP-05"
+            assert "Tugas PP-05" in embed.description
+            assert embed.fields[0].name == "Tags Pencarian"
+            assert "#PP-05" in embed.fields[0].value
+
+            author.send.assert_awaited_once()
+            dm_text = author.send.call_args.args[0]
+            assert "Ketentuan tersimpan untuk **PP-05**" in dm_text
+
+        asyncio.run(check())
+
+    def test_private_dm_forbidden_falls_back_to_channel_delete_after(self, tmp_path):
+        import asyncio
+        import discord
+        from datetime import datetime
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, Mock
+        from src.blast_reader import BlastContextStore
+        from src.discord_bot import MamazonBot
+
+        async def check():
+            contexts = BlastContextStore(tmp_path / "ctx.json")
+            bot = SimpleNamespace(
+                has_permission=Mock(return_value=True),
+                processed=set(),
+                contexts=contexts,
+                outputs=SimpleNamespace(audit=Mock()),
+                audit_mirror=AsyncMock(),
+            )
+            resp = SimpleNamespace(status=403, reason="Forbidden")
+            author = SimpleNamespace(
+                id=1,
+                bot=False,
+                mention="<@1>",
+                send=AsyncMock(side_effect=discord.Forbidden(resp, "cannot DM")),
+            )
+            msg = SimpleNamespace(
+                content="BLAST TUGAS PP-05\nDeadline: 28 Oktober 2026 15:00",
+                id=123,
+                author=author,
+                channel=SimpleNamespace(name="blast-tugas"),
+                created_at=datetime(2026, 10, 26, 10, 0),
+                reply=AsyncMock(),
+                add_reaction=AsyncMock(),
+            )
+            await MamazonBot._handle_blast_message(bot, msg)
+
+            assert msg.reply.call_count == 2
+            fallback_call = msg.reply.call_args_list[1]
+            assert fallback_call.kwargs.get("delete_after") == 10
+            assert "Ketentuan tersimpan" in fallback_call.args[0]
+
         asyncio.run(check())

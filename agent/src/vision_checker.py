@@ -1,15 +1,14 @@
 """
 Vision backends.
 
-Both backends must return the same `VisionFacts` shape:
-  • MockVision     — deterministic, no API key, no network. Used for development
-                     and for the offline demo. Seeded by (panitia, task) so the
-                     same row always produces the same verdict.
-  • TencentVision  — Tencent Cloud Hunyuan vision model, JSON-only prompt.
-                     Any failure degrades to empty facts (checks then return
-                     INCONCLUSIVE) instead of guessing.
+All backends return the same `VisionFacts` shape:
+  - MockVision      - deterministic, no API key, no network. Offline demo/tests.
+  - NineRouterVision - OpenAI-compatible HTTP chat completions with image parts
+                        through the 9Router gateway.
 
-Switch with VISION_PROVIDER=auto|mock|tencent in agent/.env.
+9Router is the only AI backend: it fronts several upstream providers and
+routes between them, by model id or through a named combo. The same gateway
+serves the #ai-chat text model. An unsupported provider fails loudly.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ import base64
 import hashlib
 import json
 import re
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -301,89 +301,6 @@ def build_prompt(hints: "VisionHints") -> str:
     return _PROMPT.replace("<<CONTEXT>>", _context_text(hints))
 
 
-class TencentVision(VisionBackend):
-    """
-    Tencent Cloud Hunyuan vision backend.
-
-    Requires TENCENT_SECRET_ID / TENCENT_SECRET_KEY. On any error the backend
-    returns empty facts so the engine degrades to INCONCLUSIVE — never a fine.
-    """
-
-    name = "tencent"
-
-    def __init__(self) -> None:
-        self._client = None
-        self._init_error: str | None = None
-        try:  # imported lazily so the mock path needs no SDK
-            from tencentcloud.common import credential
-            from tencentcloud.common.profile.client_profile import ClientProfile
-            from tencentcloud.common.profile.http_profile import HttpProfile
-            from tencentcloud.hunyuan.v20230901 import hunyuan_client
-
-            cred = credential.Credential(
-                config.TENCENT_SECRET_ID, config.TENCENT_SECRET_KEY
-            )
-            http_profile = HttpProfile()
-            http_profile.endpoint = config.TENCENT_VISION_ENDPOINT
-            http_profile.reqTimeout = 60
-            client_profile = ClientProfile()
-            client_profile.httpProfile = http_profile
-            self._client = hunyuan_client.HunyuanClient(
-                cred, config.TENCENT_REGION, client_profile
-            )
-        except Exception as exc:  # missing SDK or bad credentials
-            self._init_error = f"{type(exc).__name__}: {exc}"
-
-    def analyze(self, images: Sequence[DownloadedImage], hints: VisionHints) -> VisionFacts:
-        usable = [image for image in images if image.ok and image.path]
-        if not usable or self._client is None:
-            facts = VisionFacts(image_count=len(usable), provider=self.name, confidence=0.0)
-            facts.raw["error"] = self._init_error or "no usable images"
-            return facts
-
-        try:
-            payload = self._call_api(usable, hints)
-            return self._to_facts(payload, len(usable))
-        except Exception as exc:
-            facts = VisionFacts(image_count=len(usable), provider=self.name, confidence=0.0)
-            facts.raw["error"] = f"{type(exc).__name__}: {exc}"
-            facts.flag("vision_error")
-            return facts
-
-    def _call_api(self, images: Sequence[DownloadedImage], hints: VisionHints) -> dict:
-        from tencentcloud.hunyuan.v20230901 import models as hunyuan_models
-
-        content: list[dict] = [
-            {
-                "Type": "text",
-                "Text": build_prompt(hints),
-            }
-        ]
-        for image in images[:8]:  # cap: 8 screenshots per submission
-            with open(image.path, "rb") as handle:
-                encoded = base64.b64encode(handle.read()).decode("ascii")
-            content.append(
-                {"Type": "image_url", "ImageUrl": {"Url": f"data:image/jpeg;base64,{encoded}"}}
-            )
-
-        request = hunyuan_models.ChatCompletionsRequest()
-        request.from_json_string(
-            json.dumps(
-                {
-                    "Model": config.TENCENT_VISION_MODEL,
-                    "Messages": [{"Role": "user", "Content": content}],
-                    "Stream": False,
-                }
-            )
-        )
-        response = self._client.ChatCompletions(request)
-        text = response.Choices[0].Message.Content or ""
-        return _extract_json(text)
-
-    def _to_facts(self, payload: dict, image_count: int) -> VisionFacts:
-        return facts_from_payload(payload, image_count, self.name)
-
-
 def _context_text(hints: VisionHints) -> str:
     return json.dumps(
         {
@@ -433,7 +350,7 @@ def facts_from_payload(payload: dict, image_count: int, provider: str) -> Vision
     """
     Map the model's JSON answer onto VisionFacts.
 
-    Shared by every real backend so Tencent and OpenRouter can never drift apart.
+    Shared by every real backend so every gateway error is reported alike.
     Unknown/missing keys stay None, which makes the checks return INCONCLUSIVE
     instead of guessing.
     """
@@ -464,7 +381,7 @@ def facts_from_payload(payload: dict, image_count: int, provider: str) -> Vision
     return facts
 
 
-# ─── OpenRouter (OpenAI-compatible) ────────────────────────────────────────────
+# ─── 9Router gateway (OpenAI-compatible) ─────────────────────────────────────
 class HTTPStatusError(RuntimeError):
     """HTTP 4xx/5xx from the router, with the status kept for diagnostics."""
 
@@ -534,22 +451,22 @@ class _UrllibSession:
             raise TimeoutError("request timeout") from exc
 
 
-class OpenRouterVision(VisionBackend):
+class NineRouterVision(VisionBackend):
     """
-    Vision through OpenRouter (https://openrouter.ai/api/v1).
+    Vision and chat through the 9Router gateway.
 
-        export VISION_PROVIDER=openrouter
-        export OPENROUTER_API_KEY=sk-or-v1-...
-        export OPENROUTER_MODEL=google/gemini-2.0-flash-001   # must accept images
+        export NINEROUTER_BASE_URL=http://localhost:20128/v1
+        export NINEROUTER_API_KEY=sk-...
+        export NINEROUTER_MODEL=mamazon     # a combo name or an exact model id
 
-    OpenRouter is OpenAI-compatible, so the request is a normal chat completion
+    9Router is OpenAI-compatible, so the request is a normal chat completion
     with `image_url` data-URL parts. Any failure returns empty facts flagged
-    `vision_error`, which the checks turn into INCONCLUSIVE — it never invents a
-    verdict and never falls back to mock, because a mock verdict would look like
-    real evidence for a real panitia.
+    `vision_error`, which the checks turn into INCONCLUSIVE - it never invents
+    a verdict and never falls back to mock, because a mock verdict would look
+    like real evidence for a real panitia.
     """
 
-    name = "openrouter"
+    name = "9router"
 
     def __init__(
         self,
@@ -561,14 +478,14 @@ class OpenRouterVision(VisionBackend):
         site_url: str | None = None,
         app_name: str | None = None,
     ) -> None:
-        self.base_url = (base_url or config.OPENROUTER_BASE_URL).rstrip("/")
-        self.api_key = api_key if api_key is not None else config.OPENROUTER_API_KEY
+        self.base_url = (base_url or config.effective_ninerouter_base_url()).rstrip("/")
+        self.api_key = api_key if api_key is not None else config.NINEROUTER_API_KEY
         # `is not None` (not `or`): an explicit empty model must stay empty so
         # health() can report it instead of silently inheriting the env value.
-        self.model = model if model is not None else config.OPENROUTER_MODEL
-        self.timeout = timeout or config.OPENROUTER_TIMEOUT
-        self.site_url = site_url if site_url is not None else config.OPENROUTER_SITE_URL
-        self.app_name = app_name if app_name is not None else config.OPENROUTER_APP_NAME
+        self.model = model if model is not None else config.NINEROUTER_MODEL
+        self.timeout = timeout or config.NINEROUTER_TIMEOUT
+        self.site_url = site_url if site_url is not None else config.NINEROUTER_SITE_URL
+        self.app_name = app_name if app_name is not None else config.NINEROUTER_APP_NAME
         self._session = session
         self.last_error = ""
 
@@ -583,35 +500,23 @@ class OpenRouterVision(VisionBackend):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        # Optional attribution; only affects OpenRouter's leaderboards.
+        # Optional attribution; the gateway may log it.
         if self.site_url:
             headers["HTTP-Referer"] = self.site_url
         if self.app_name:
-            headers["X-OpenRouter-Title"] = self.app_name
+            headers["X-9Router-Title"] = self.app_name
         return headers
 
     def list_models(self) -> list[str]:
-        """GET /models — public on OpenRouter, so this works before a key exists."""
-        response = self.session.get(
-            f"{self.base_url}/models",
-            headers=self._headers(),
-            timeout=min(20, self.timeout),
-        )
-        if response.status_code >= 400:
-            raise HTTPStatusError(response.status_code, response.text)
-        data = response.json()
-        return [
-            str(item.get("id"))
-            for item in (data.get("data") or [])
-            if isinstance(item, dict) and item.get("id")
-        ]
+        """GET /models — returns every model id and combo name the gateway has."""
+        return [entry["id"] for entry in self.list_model_entries()]
 
-    def list_vision_models(self) -> list[dict]:
-        """
-        Models whose `architecture.input_modalities` includes image.
+    def list_model_entries(self) -> list[dict]:
+        """GET /models with 9Router capability flags.
 
-        OpenRouter publishes this, so we can refuse a text-only model before
-        spending a credit on a request that would 400.
+        9Router marks each entry with `capabilities` (vision, tools, ...) and
+        `owned_by` ("combo" for a named fallback chain), which lets us refuse a
+        text-only model before spending a request that would 400.
         """
         response = self.session.get(
             f"{self.base_url}/models",
@@ -621,31 +526,35 @@ class OpenRouterVision(VisionBackend):
         if response.status_code >= 400:
             raise HTTPStatusError(response.status_code, response.text)
         data = response.json()
-
-        vision: list[dict] = []
+        entries: list[dict] = []
         for item in data.get("data") or []:
             if not isinstance(item, dict) or not item.get("id"):
                 continue
-            architecture = item.get("architecture") or {}
-            modalities = architecture.get("input_modalities") or []
-            if "image" not in modalities:
-                continue
-            pricing = item.get("pricing") or {}
-            vision.append(
+            capabilities = item.get("capabilities") or {}
+            entries.append(
                 {
                     "id": str(item["id"]),
-                    "name": item.get("name", ""),
-                    "context": item.get("context_length"),
-                    "prompt_price": pricing.get("prompt"),
+                    "owned_by": str(item.get("owned_by") or ""),
+                    "combo": item.get("owned_by") == "combo",
+                    "vision": bool(capabilities.get("vision")),
+                    "tools": bool(capabilities.get("tools")),
+                    "context_length": item.get("context_length"),
                 }
             )
-        vision.sort(key=lambda model: model["id"])
-        return vision
+        entries.sort(key=lambda entry: entry["id"])
+        return entries
+
+    def list_vision_models(self) -> list[dict]:
+        """Models and combos the gateway marks as vision-capable."""
+        return [
+            entry for entry in self.list_model_entries() if entry["vision"]
+        ]
+
 
     def health(self) -> tuple[bool, str]:
         if not self.model:
             return False, (
-                "OPENROUTER_MODEL kosong — pilih model vision, lihat "
+                "NINEROUTER_MODEL kosong — pilih model vision, lihat "
                 "`vision-status --models 20`"
             )
         try:
@@ -663,8 +572,8 @@ class OpenRouterVision(VisionBackend):
             )
         if not self.api_key:
             return False, (
-                f"Model '{self.model}' OK, tapi OPENROUTER_API_KEY kosong — "
-                "request chat akan 401. Buat key di https://openrouter.ai/keys"
+                f"Model '{self.model}' OK, tapi NINEROUTER_API_KEY kosong — "
+                "request chat akan 401. Buat key di dashboard 9Router lalu isi NINEROUTER_API_KEY"
             )
         return True, f"OK — '{self.model}' terdaftar sebagai model vision"
 
@@ -681,9 +590,9 @@ class OpenRouterVision(VisionBackend):
             facts = VisionFacts(
                 image_count=len(usable), provider=self.name, confidence=0.0
             )
-            facts.raw["error"] = "OPENROUTER_MODEL kosong"
+            facts.raw["error"] = "NINEROUTER_MODEL kosong"
             facts.flag("vision_error")
-            self.last_error = "OPENROUTER_MODEL kosong"
+            self.last_error = "NINEROUTER_MODEL kosong"
             return facts
 
         try:
@@ -745,7 +654,7 @@ class OpenRouterVision(VisionBackend):
         return True, text, payload
 
     def _chat(self, content: list, max_tokens: int | None = None) -> dict:
-        budget = max_tokens or config.OPENROUTER_MAX_TOKENS
+        budget = max_tokens or config.NINEROUTER_MAX_TOKENS
         body = {
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
@@ -753,12 +662,12 @@ class OpenRouterVision(VisionBackend):
             "max_tokens": budget,
             "stream": False,
         }
-        if config.OPENROUTER_JSON_MODE:
+        if config.NINEROUTER_JSON_MODE:
             body["response_format"] = {"type": "json_object"}
-        if config.OPENROUTER_REASONING_EFFORT:
+        if config.NINEROUTER_REASONING_EFFORT:
             # Reasoning models otherwise spend the whole token budget thinking
             # and return empty content.
-            body["reasoning"] = {"effort": config.OPENROUTER_REASONING_EFFORT}
+            body["reasoning"] = {"effort": config.NINEROUTER_REASONING_EFFORT}
 
         data = self._post(body)
         if data is None:  # provider rejected response_format — retry plainly
@@ -785,7 +694,7 @@ class OpenRouterVision(VisionBackend):
                 f"content kosong (finish_reason={finish}). "
                 "Model menghabiskan token untuk reasoning — pakai model vision "
                 "non-reasoning (mis. google/gemini-2.0-flash-001) atau naikkan "
-                "OPENROUTER_MAX_TOKENS."
+                "NINEROUTER_MAX_TOKENS."
             )
             if reasoning:
                 hint += f" Reasoning: {str(reasoning)[:120]}"
@@ -839,7 +748,7 @@ class OpenRouterVision(VisionBackend):
 
     def _content(self, images: Sequence[DownloadedImage], hints: VisionHints) -> list:
         parts: list[dict] = [{"type": "text", "text": build_prompt(hints)}]
-        for image in list(images)[: config.OPENROUTER_MAX_IMAGES]:
+        for image in list(images)[: config.NINEROUTER_MAX_IMAGES]:
             try:
                 with open(image.path, "rb") as handle:
                     encoded = base64.b64encode(handle.read()).decode("ascii")
@@ -865,20 +774,20 @@ class OpenRouterVision(VisionBackend):
         if isinstance(exc, TimeoutError):
             return (
                 f"Timeout setelah {self.timeout}s. Model vision bisa lambat untuk "
-                "banyak gambar — naikkan OPENROUTER_TIMEOUT atau turunkan "
-                "OPENROUTER_MAX_IMAGES."
+                "banyak gambar — naikkan NINEROUTER_TIMEOUT atau turunkan "
+                "NINEROUTER_MAX_IMAGES."
             )
         if isinstance(exc, HTTPStatusError):
             status = exc.status_code
             if status == 401:
                 return (
-                    "401 Unauthorized — OPENROUTER_API_KEY salah atau kosong. "
-                    "Buat key di https://openrouter.ai/keys lalu isi ulang."
+                    "401 Unauthorized — NINEROUTER_API_KEY salah atau kosong. "
+                    "Buat key di dashboard 9Router lalu isi ulang."
                 )
             if status == 402:
                 return (
-                    "402 Payment Required — kredit OpenRouter habis. Top up di "
-                    "https://openrouter.ai/credits, atau pilih model yang lebih murah."
+                    "402 Payment Required — kuota/kredit gateway habis. "
+                    "gateway 9Router (cek quota/kredensial), atau pilih model yang lebih murah."
                 )
             if status == 404:
                 return (
@@ -887,14 +796,14 @@ class OpenRouterVision(VisionBackend):
                 )
             if status == 429:
                 return (
-                    "429 — rate limit OpenRouter. Model ':free' dibatasi ketat "
+                    "429 — rate limit gateway. Coba model/combo lain "
                     "(±20 req/menit, dan kuota harian lebih kecil bila saldo < $10). "
                     "Tunggu 1 menit, atau pakai model berbayar murah. "
                     "Validasi penuh 76 baris bisa kena limit ini berkali-kali."
                 )
             if status in (502, 503, 504):
                 return (
-                    f"{status} — provider di balik OpenRouter sedang gangguan. "
+                    f"{status} — provider di balik 9Router sedang gangguan. "
                     "Coba lagi, atau pilih model lain. "
                     f"Respons: {exc.body[:120]}"
                 )
@@ -937,18 +846,21 @@ class UnavailableVision(VisionBackend):
 
 # ─── Factory ────────────────────────────────────────────────────────────────
 def build_vision_backend(provider: str | None = None) -> VisionBackend:
-    provider = (provider or config.VISION_PROVIDER).lower()
-    if provider in {"openrouter", "or", "openrouter.ai", "openai"}:
-        return OpenRouterVision()
-    if provider == "tencent":
-        backend = TencentVision()
-        if backend._client is not None:
-            return backend
-        return UnavailableVision(
-            "Tencent Vision tidak siap: "
-            f"{backend._init_error or 'client gagal dibuat'}. "
-            "Install `pip install tencentcloud-sdk-python` dan isi "
-            "TENCENT_SECRET_ID/KEY, atau pindah ke OpenRouter "
-            "(VISION_PROVIDER=openrouter)."
-        )
-    return MockVision()
+    """Return the vision backend. 9Router is the only real provider."""
+    provider = (provider or config.AI_PROVIDER).lower()
+    provider = {
+        "9router": "9router",
+        "ninerouter": "9router",
+        "9r": "9router",
+        "offline": "mock",
+        "mock": "mock",
+    }.get(provider, provider)
+    if provider == "9router":
+        return NineRouterVision()
+    if provider == "mock":
+        return MockVision()
+    return UnavailableVision(
+        f"Provider '{provider}' is not supported. 9Router is the only AI "
+        "backend; set NINEROUTER_BASE_URL / NINEROUTER_API_KEY / "
+        "NINEROUTER_MODEL. 'mock' is reserved for offline tests."
+    )

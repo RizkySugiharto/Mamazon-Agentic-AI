@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 
 try:  # python-dotenv is optional; the agent must still boot without it
@@ -35,8 +37,14 @@ if load_dotenv is not None:
 
 REFS_DIR = Path(os.environ.get("REFS_DIR", WORKSPACE_ROOT / "_refs"))
 
-# Data files
-RULEBASE_PATH = Path(os.environ.get("RULEBASE_PATH", REFS_DIR / "rulebase.json"))
+# Data & Rules files
+DATA_DIR = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
+RULES_DIR = Path(os.environ.get("RULES_DIR", DATA_DIR / "rules"))
+AGENT_RULES_PATH = Path(
+    os.environ.get("AGENT_RULES_PATH", RULES_DIR / "agent_rules.md")
+)
+# Compatibility alias
+RULEBASE_PATH = RULES_DIR
 DUMMY_DATA_PATH = Path(
     os.environ.get("DUMMY_DATA_PATH", REFS_DIR / "dummy_dataset_anonymized.xlsx")
 )
@@ -55,6 +63,9 @@ BLAST_STORE_DIR = OUTPUT_DIR / "blasts"
 TMP_DIR = Path(os.environ.get("TMP_DIR", PROJECT_ROOT / "tmp"))
 IMAGE_TMP_DIR = TMP_DIR / "images"
 HASH_CACHE_PATH = TMP_DIR / "hashes.json"
+
+# Logs (daily date-divided)
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", PROJECT_ROOT / "logs"))
 
 # Config
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -96,61 +107,129 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
-# ─── Adapter selection ──────────────────────────────────────────────────────
-# Vision: "auto" picks tencent when keys exist, otherwise mock.
-TENCENT_SECRET_ID = _env("TENCENT_SECRET_ID")
-TENCENT_SECRET_KEY = _env("TENCENT_SECRET_KEY")
-TENCENT_REGION = _env("TENCENT_REGION", "ap-jakarta")
-TENCENT_VISION_MODEL = _env("TENCENT_VISION_MODEL", "hunyuan-vision")
-TENCENT_VISION_ENDPOINT = _env(
-    "TENCENT_VISION_ENDPOINT", "hunyuan.tencentcloudapi.com"
-)
-
-# ─── OpenRouter (Vision backend) ────────────────────────────────────────────
-# https://openrouter.ai/api/v1 — OpenAI-compatible, Bearer auth.
-# Model ids are "provider/model" (openai/gpt-4o-mini,
-# google/gemini-2.0-flash-001) and MUST accept image input.
-OPENROUTER_BASE_URL = _env(
-    "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
+# ─── 9Router (the one and only AI backend) ─────────────────────────────────
+# 9Router is a self-hosted OpenAI-compatible gateway. It fronts several
+# upstream providers and routes between them, either directly by model id or
+# through a named "combo" (an ordered fallback chain).
+#
+#   base url : the gateway's OpenAI-compatible endpoint, usually
+#              http://localhost:20128/v1
+#   api key  : the gateway key (Bearer), created in the 9Router dashboard
+#   model    : either an exact model id ("ag/gemini-3.8-flash-low") or the
+#              name of a combo ("mamazon") that 9Router resolves itself
+#
+# Nothing is guessed: the model is sent exactly as configured.
+NINEROUTER_BASE_URL = _env(
+    "NINEROUTER_BASE_URL", "http://localhost:20128/v1"
 ).rstrip("/")
-OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = _env("OPENROUTER_MODEL")
-OPENROUTER_TIMEOUT = _env_int("OPENROUTER_TIMEOUT", 90)
-OPENROUTER_MAX_IMAGES = _env_int("OPENROUTER_MAX_IMAGES", 8)
-OPENROUTER_MAX_TOKENS = _env_int("OPENROUTER_MAX_TOKENS", 3000)
+NINEROUTER_API_KEY = _env("NINEROUTER_API_KEY")
+NINEROUTER_MODEL = _env("NINEROUTER_MODEL", "mamazon")
+NINEROUTER_TIMEOUT = max(1, _env_int("NINEROUTER_TIMEOUT", 120))
+NINEROUTER_MAX_IMAGES = max(1, _env_int("NINEROUTER_MAX_IMAGES", 8))
+NINEROUTER_MAX_TOKENS = max(256, _env_int("NINEROUTER_MAX_TOKENS", 3000))
 # Ask for a JSON object; retried without it when a model rejects the parameter.
-OPENROUTER_JSON_MODE = _env_bool("OPENROUTER_JSON_MODE", True)
+NINEROUTER_JSON_MODE = _env_bool("NINEROUTER_JSON_MODE", True)
 # low|medium|high. Set for reasoning models so they do not spend the whole
 # token budget thinking and return empty content.
-OPENROUTER_REASONING_EFFORT = _env("OPENROUTER_REASONING_EFFORT", "").lower()
-# Optional attribution headers (only affect OpenRouter leaderboards).
-OPENROUTER_SITE_URL = _env("OPENROUTER_SITE_URL", "https://github.com/mamazon/spade-agent")
-OPENROUTER_APP_NAME = _env("OPENROUTER_APP_NAME", "Mamazon Spade Agent")
+NINEROUTER_REASONING_EFFORT = _env("NINEROUTER_REASONING_EFFORT", "").lower()
+# Optional attribution headers (only affect gateway-side leaderboards).
+NINEROUTER_SITE_URL = _env("NINEROUTER_SITE_URL", "https://github.com/mamazon/spade-agent")
+NINEROUTER_APP_NAME = _env("NINEROUTER_APP_NAME", "Mamazon Spade Agent")
+# The gateway is usually local; some deployments still sit behind a proxy that
+# blocks the default urllib agent.
+NINEROUTER_USER_AGENT = _env(
+    "NINEROUTER_USER_AGENT", "MamazonSpadeAgent/1.0 (+9Router)"
+)
 
-# Text chat reuses the configured OpenRouter model/key; Vision remains separate.
+# ─── Bounded agent tools (no arbitrary code execution) ─────────────────────
+CHAT_TOOLS_ENABLED = _env_bool("CHAT_TOOLS_ENABLED", True)
+CHAT_INCLUDE_TEMPLATES = _env_bool("CHAT_INCLUDE_TEMPLATES", False)
+CHAT_MEMORY_ENABLED = _env_bool("CHAT_MEMORY_ENABLED", True)
+CHAT_MEMORY_PATH = Path(_env("CHAT_MEMORY_PATH", str(OUTPUT_DIR / "chat_memory.json")))
+CHAT_MEMORY_MAX_ITEMS = max(1, _env_int("CHAT_MEMORY_MAX_ITEMS", 20))
+WEB_SEARCH_URL = _env("WEB_SEARCH_URL")
+WEB_SEARCH_API_KEY = _env("WEB_SEARCH_API_KEY")
+WEB_SEARCH_TIMEOUT = max(1, _env_int("WEB_SEARCH_TIMEOUT", 10))
+WEB_SEARCH_MAX_RESULTS = max(1, _env_int("WEB_SEARCH_MAX_RESULTS", 3))
+
+# ─── Agentic chat (LangChain + LangGraph + local zvec) ─────────────────────
+# The deterministic chat_agent stays the fallback; this is the conversational
+# path that retrieves from a local vector store and calls read-only tools.
+CHAT_AGENT_ENABLED = _env_bool("CHAT_AGENT_ENABLED", True)
+# Max graph steps (retrieval + tool calls) per question.
+CHAT_AGENT_MAX_STEPS = max(1, _env_int("CHAT_AGENT_MAX_STEPS", 6))
+# Documents pulled from the vector store per retrieval.
+CHAT_AGENT_TOP_K = max(1, _env_int("CHAT_AGENT_TOP_K", 5))
+# Retrieval score floor; below this the context is treated as irrelevant.
+# Measured on the multilingual model: on-topic rules score ~0.70-0.80,
+# loosely related ~0.50, off-topic noise ~0.37.
+CHAT_AGENT_MIN_SCORE = _env_float("CHAT_AGENT_MIN_SCORE", 0.45)
+# Corpus chunks kept in the prompt (chars) so we never blow the context.
+CHAT_AGENT_MAX_CONTEXT_CHARS = max(1000, _env_int("CHAT_AGENT_MAX_CONTEXT_CHARS", 6000))
+
+# Local vector store (zvec) — embedded, no server, no Docker.
+VECTOR_DB_DIR = Path(_env("VECTOR_DB_DIR", str(PROJECT_ROOT / "data" / "vectorstore")))
+VECTOR_DB_COLLECTION = _env("VECTOR_DB_COLLECTION", "mamazon_knowledge")
+# Local embedding model. multilingual-e5 handles Indonesian + English.
+EMBEDDING_MODEL = _env(
+    "EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
+EMBEDDING_DIM = max(1, _env_int("EMBEDDING_DIM", 384))
+# Rebuild the corpus when the rulebase or the source fingerprint changes.
+KB_REBUILD_ON_CHANGE = _env_bool("KB_REBUILD_ON_CHANGE", True)
+KB_COLLECTION_NAME = _env("KB_COLLECTION_NAME", "mamazon_knowledge")
+
+# ─── One provider for both screenshot reading and #ai-chat ─────────────────
 CHAT_ENABLED = _env_bool("CHAT_ENABLED", True)
-CHAT_MODEL = _env("CHAT_MODEL", OPENROUTER_MODEL)
 CHAT_TIMEOUT = max(1, _env_int("CHAT_TIMEOUT", 30))
 CHAT_MAX_TOKENS = max(256, _env_int("CHAT_MAX_TOKENS", 2000))
+CHAT_MODEL = NINEROUTER_MODEL  # read-only compatibility alias
 
-_VISION_PROVIDER = _env("VISION_PROVIDER", "auto").lower()
-if _VISION_PROVIDER == "auto":
-    # Precedence: OpenRouter (explicitly configured) -> Tencent -> mock.
-    if OPENROUTER_API_KEY or OPENROUTER_MODEL:
-        VISION_PROVIDER = "openrouter"
-    elif TENCENT_SECRET_ID and TENCENT_SECRET_KEY:
-        VISION_PROVIDER = "tencent"
-    else:
-        VISION_PROVIDER = "mock"
-else:
-    VISION_PROVIDER = {
-        "or": "openrouter",
-        "openrouter.ai": "openrouter",
-        "openai": "openrouter",  # OpenRouter speaks the OpenAI wire format
-    }.get(_VISION_PROVIDER, _VISION_PROVIDER)
+# 9Router is the only backend. "mock" stays available as an offline mode for
+# tests and demos, but it is never a real provider and is never auto-selected.
+AI_PROVIDER = "9router"
+AI_PROVIDERS = {"9router", "mock"}
+# Legacy aliases are mirrors, not separate selectors.
+VISION_PROVIDER = AI_PROVIDER
+AI_AGENT_PROVIDER = AI_PROVIDER
+CHAT_PROVIDER = AI_PROVIDER
+# Offline mode is opt-in only, so a missing key never silently fakes a verdict.
+USE_MOCK_VISION = _env_bool("AI_OFFLINE", False)
+# Provider names that used to exist. They are rejected loudly instead of
+# silently falling back to another backend.
+REMOVED_AI_PROVIDERS = {
+    "openrouter", "or", "openai", "opencode", "opencode-cli", "open-code",
+    "opencode-api", "opencode_api", "opencodeapi", "opencode-http",
+    "opencode-server", "opencode-console", "open-code-api", "local",
+    "tencent", "tencent-cloud", "hunyuan", "agy", "agy-cli",
+    "antigravity", "antigravity-cli", "local-agy", "off", "none", "disabled",
+}
 
-# Kept for backwards compatibility with the planning documents.
-USE_MOCK_VISION = VISION_PROVIDER == "mock"
+
+def effective_ninerouter_base_url() -> str:
+    """Accept either an API base or a pasted full /chat/completions URL."""
+    base = NINEROUTER_BASE_URL.rstrip("/")
+    suffix = "/chat/completions"
+    return base[: -len(suffix)] if base.endswith(suffix) else base
+
+
+def ai_provider_warnings() -> list[str]:
+    """Non-blocking, secret-free operational warnings."""
+    warnings: list[str] = []
+    if not NINEROUTER_API_KEY:
+        warnings.append(
+            "NINEROUTER_API_KEY is empty. The 9Router gateway requires its own "
+            "Bearer key (create one in the 9Router dashboard). Requests will 401."
+        )
+    if not NINEROUTER_BASE_URL.startswith("http"):
+        warnings.append(f"NINEROUTER_BASE_URL looks wrong: {NINEROUTER_BASE_URL}")
+    if not NINEROUTER_MODEL:
+        warnings.append(
+            "NINEROUTER_MODEL is empty. Use an exact model id or a 9Router "
+            "combo name (default: mamazon)."
+        )
+    return warnings
+
 
 # Drive: "auto" picks google when a service account file exists, else mock.
 _DRIVE_PROVIDER = _env("DRIVE_PROVIDER", "auto").lower()
@@ -245,6 +324,8 @@ PERMISSIONS = {
     "ketentuan-angel-card": (ROLE_BPH, ROLE_KOOR, ROLE_SPADE, ROLE_PANITIA),
     "scan-blast": (ROLE_BPH, ROLE_KOOR),
     "list-sheets": (ROLE_BPH, ROLE_KOOR, ROLE_SPADE),
+    "roster-set-discord": (ROLE_BPH, ROLE_KOOR),
+    "roster-remove-discord": (ROLE_BPH, ROLE_KOOR),
 }
 
 
@@ -353,8 +434,8 @@ def validate_config(require_discord: bool = False) -> list[str]:
     """Return a list of human-readable configuration problems."""
     issues: list[str] = []
 
-    if not RULEBASE_PATH.exists():
-        issues.append(f"Rulebase not found: {RULEBASE_PATH}")
+    if not RULES_DIR.exists():
+        issues.append(f"Rules directory not found: {RULES_DIR}")
     if SHEET_SOURCE in {"gsheets", "google", "google-sheets", "sheets"}:
         if not GOOGLE_SPREADSHEET_ID:
             issues.append(
@@ -375,30 +456,7 @@ def validate_config(require_discord: bool = False) -> list[str]:
             f"Dataset not found: {DUMMY_DATA_PATH} "
             "(run `python _refs/build_dummy.py` to generate fixtures)"
         )
-    if VISION_PROVIDER == "tencent":
-        if not (TENCENT_SECRET_ID and TENCENT_SECRET_KEY):
-            issues.append("VISION_PROVIDER=tencent but Tencent keys are missing")
-        if not module_available("tencentcloud"):
-            issues.append(
-                "VISION_PROVIDER=tencent but the SDK is not installed "
-                "(pip install tencentcloud-sdk-python)"
-            )
-    if VISION_PROVIDER == "openrouter":
-        if not OPENROUTER_API_KEY:
-            issues.append(
-                "VISION_PROVIDER=openrouter but OPENROUTER_API_KEY is empty — create a "
-                "key at https://openrouter.ai/keys"
-            )
-        if not OPENROUTER_MODEL:
-            issues.append(
-                "VISION_PROVIDER=openrouter but OPENROUTER_MODEL is empty — pick a "
-                "vision model (python -m src.main vision-status --models 20)"
-            )
-        if not OPENROUTER_BASE_URL.startswith("http"):
-            issues.append(
-                f"OPENROUTER_BASE_URL looks wrong: {OPENROUTER_BASE_URL} "
-                "(expected https://openrouter.ai/api/v1)"
-            )
+    issues.extend(validate_ai_config())
     if DRIVE_PROVIDER == "google":
         if not SERVICE_ACCOUNT_PATH.exists():
             issues.append(
@@ -430,13 +488,80 @@ def validate_config(require_discord: bool = False) -> list[str]:
     return issues
 
 
+def active_ai_model() -> str:
+    """Exact model used by both Vision and chat; never substituted."""
+    return NINEROUTER_MODEL
+
+
+def active_chat_model() -> str:
+    """Compatibility alias for callers written before unification."""
+    return active_ai_model()
+
+
+def validate_ai_config() -> list[str]:
+    """Validate the single provider used by screenshot reading and text chat."""
+    issues: list[str] = []
+    if USE_MOCK_VISION:
+        # Offline mode: no gateway required, and nothing is faked silently
+        # because the operator asked for it explicitly.
+        return issues
+    if not NINEROUTER_API_KEY:
+        issues.append(
+            "NINEROUTER_API_KEY is empty — set the 9Router gateway key "
+            "(dashboard → API keys)"
+        )
+    if not NINEROUTER_MODEL:
+        issues.append(
+            "NINEROUTER_MODEL is empty — set an exact model id or a 9Router "
+            "combo name (default: mamazon)"
+        )
+    base = effective_ninerouter_base_url()
+    if not base.startswith("http"):
+        issues.append(f"NINEROUTER_BASE_URL looks wrong: {base}")
+    return issues
+
+
+def validate_chat_config() -> list[str]:
+    """Compatibility alias: chat and Vision now share one validation."""
+    return validate_ai_config()
+
+
+def ai_provider_status() -> dict[str, object]:
+    """Safe, secret-free summary for CLI, /help and startup diagnostics."""
+    return {
+        "provider": AI_PROVIDER,
+        "model": active_ai_model(),
+        "configured_model": NINEROUTER_MODEL,
+        "chat_enabled": CHAT_ENABLED,
+        "enabled": bool(CHAT_ENABLED and not USE_MOCK_VISION),
+        "tools_enabled": CHAT_TOOLS_ENABLED,
+        "include_templates": CHAT_INCLUDE_TEMPLATES,
+        "memory_enabled": CHAT_MEMORY_ENABLED,
+        "rules_dir": str(RULES_DIR),
+        "web_search_configured": bool(WEB_SEARCH_URL),
+        "api_base_url": effective_ninerouter_base_url(),
+        "api_user_agent": NINEROUTER_USER_AGENT,
+        "api_key_set": bool(NINEROUTER_API_KEY),
+        "offline": USE_MOCK_VISION,
+        "issues": validate_ai_config(),
+        "warnings": ai_provider_warnings(),
+    }
+
+
+
+def chat_provider_status() -> dict[str, object]:
+    """Compatibility alias for code written before Vision/chat unification."""
+    return ai_provider_status()
+
+
 if __name__ == "__main__":
     print("=== Config Check ===")
     print(f"Project root     : {PROJECT_ROOT}")
     print(f"Rulebase         : {RULEBASE_PATH} ({'OK' if RULEBASE_PATH.exists() else 'MISSING'})")
     print(f"Dataset          : {DUMMY_DATA_PATH} ({'OK' if DUMMY_DATA_PATH.exists() else 'MISSING'})")
     print(f"Output dir       : {OUTPUT_DIR} ({'OK' if OUTPUT_DIR.exists() else 'MISSING'})")
-    print(f"Vision provider  : {VISION_PROVIDER}")
+    print(f"AI provider      : {AI_PROVIDER} (Vision + chat)")
+    print(f"AI model         : {active_ai_model() or '-'}")
     print(f"Drive provider   : {DRIVE_PROVIDER}")
     print(f"Discord token    : {'SET' if DISCORD_BOT_TOKEN else 'NOT SET'}")
     print(f"Discord guild    : {'SET' if DISCORD_GUILD_ID else 'NOT SET'}")

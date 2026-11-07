@@ -43,7 +43,7 @@ class SheetRateLimitError(SheetSourceError):
     """429 or quota-related 403 after retry exhaustion."""
 
 
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets.readonly"
+SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
 _SHEET_ID_RE = re.compile(r"/spreadsheets/d/([A-Za-z0-9_-]{20,})")
@@ -66,6 +66,17 @@ def extract_spreadsheet_id(value: str | None) -> str:
 def quote_sheet_title(title: str) -> str:
     """Sheets A1 notation: wrap in single quotes, doubling inner ones."""
     return "'" + title.replace("'", "''") + "'"
+
+
+def col_to_letter(col: int) -> str:
+    """Convert 1-based column number to A1 letter notation (e.g. 1 -> 'A', 26 -> 'Z', 27 -> 'AA')."""
+    if col <= 0:
+        return "A"
+    result = ""
+    while col > 0:
+        col, remainder = divmod(col - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
 
 
 def serial_to_datetime(value: float) -> datetime | None:
@@ -126,6 +137,17 @@ class SheetSource:
     def rows(self, sheet_name: str) -> list[list[Any]]:  # pragma: no cover
         raise NotImplementedError
 
+    def append_row(self, sheet_name: str, values: list[Any]) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def update_cell(self, sheet_name: str, row: int, col: int, value: Any) -> None:  # pragma: no cover
+        """1-based row and 1-based col."""
+        raise NotImplementedError
+
+    def update_row(self, sheet_name: str, row: int, values: list[Any]) -> None:  # pragma: no cover
+        """1-based row, updates starting from column 1."""
+        raise NotImplementedError
+
     def close(self) -> None:
         pass
 
@@ -167,6 +189,46 @@ class XlsxSource(SheetSource):
     def rows(self, sheet_name: str) -> list[list[Any]]:
         worksheet = self.workbook[sheet_name]
         return [list(row) for row in worksheet.iter_rows(values_only=True)]
+
+    def append_row(self, sheet_name: str, values: list[Any]) -> None:
+        from openpyxl import load_workbook
+
+        self.close()
+        wb = load_workbook(self.path, read_only=False, data_only=False)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            raise SheetSourceError(f"Tab '{sheet_name}' tidak ditemukan di workbook.")
+        ws = wb[sheet_name]
+        ws.append(values)
+        wb.save(self.path)
+        wb.close()
+
+    def update_cell(self, sheet_name: str, row: int, col: int, value: Any) -> None:
+        from openpyxl import load_workbook
+
+        self.close()
+        wb = load_workbook(self.path, read_only=False, data_only=False)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            raise SheetSourceError(f"Tab '{sheet_name}' tidak ditemukan di workbook.")
+        ws = wb[sheet_name]
+        ws.cell(row=row, column=col, value=value)
+        wb.save(self.path)
+        wb.close()
+
+    def update_row(self, sheet_name: str, row: int, values: list[Any]) -> None:
+        from openpyxl import load_workbook
+
+        self.close()
+        wb = load_workbook(self.path, read_only=False, data_only=False)
+        if sheet_name not in wb.sheetnames:
+            wb.close()
+            raise SheetSourceError(f"Tab '{sheet_name}' tidak ditemukan di workbook.")
+        ws = wb[sheet_name]
+        for col_idx, val in enumerate(values, start=1):
+            ws.cell(row=row, column=col_idx, value=val)
+        wb.save(self.path)
+        wb.close()
 
     def close(self) -> None:
         if self._workbook is not None:
@@ -253,6 +315,24 @@ class GoogleDriveWorkbookSource(XlsxSource):
                 f"File {self.file_id[:10]}… kosong atau tidak bisa diunduh."
             )
         return load_workbook(BytesIO(data), read_only=True, data_only=True)
+
+    def append_row(self, sheet_name: str, values: list[Any]) -> None:
+        raise SheetSourceError(
+            "Tidak bisa menulis langsung ke file .xlsx di Google Drive. "
+            "Konversi file ke Google Sheet: File -> Save as Google Sheets."
+        )
+
+    def update_cell(self, sheet_name: str, row: int, col: int, value: Any) -> None:
+        raise SheetSourceError(
+            "Tidak bisa menulis langsung ke file .xlsx di Google Drive. "
+            "Konversi file ke Google Sheet: File -> Save as Google Sheets."
+        )
+
+    def update_row(self, sheet_name: str, row: int, values: list[Any]) -> None:
+        raise SheetSourceError(
+            "Tidak bisa menulis langsung ke file .xlsx di Google Drive. "
+            "Konversi file ke Google Sheet: File -> Save as Google Sheets."
+        )
 
 
 def _service_account_email(credentials_path: Path) -> str:
@@ -479,8 +559,8 @@ class GoogleSheetsSource(SheetSource):
         email = self.service_account_email() or "<service-account-email>"
         if status == 403:
             return (
-                "403 — spreadsheet tidak dibagikan ke service account. Buka sheet → "
-                f"Share → tambahkan {email} sebagai Viewer."
+                "403 — spreadsheet tidak dibagikan ke service account atau izin tidak cukup. "
+                f"Buka sheet → Share → tambahkan {email} sebagai Editor (atau Viewer untuk mode baca)."
             )
         return (
             f"404 — spreadsheet '{self.spreadsheet_id}' tidak ditemukan. Cek "
@@ -546,6 +626,58 @@ class GoogleSheetsSource(SheetSource):
         # Sheets trims trailing empty cells; keep rows rectangular for the mapper.
         width = max((len(row) for row in values), default=0)
         return [list(row) + [None] * (width - len(row)) for row in values]
+
+    def append_row(self, sheet_name: str, values: list[Any]) -> None:
+        with self._lock:
+            range_a1 = quote_sheet_title(sheet_name)
+            request = (
+                self.service.spreadsheets()
+                .values()
+                .append(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=range_a1,
+                    valueInputOption="USER_ENTERED",
+                    insertDataOption="INSERT_ROWS",
+                    body={"values": [values]},
+                )
+            )
+            self._execute(request)
+            self.invalidate()
+
+    def update_cell(self, sheet_name: str, row: int, col: int, value: Any) -> None:
+        """Update a single cell with 1-based row and 1-based col."""
+        col_letter = col_to_letter(col)
+        range_a1 = f"{quote_sheet_title(sheet_name)}!{col_letter}{row}"
+        val_str = str(value) if value is not None else ""
+        with self._lock:
+            self._execute(
+                self.service.spreadsheets()
+                .values()
+                .update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=range_a1,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[val_str]]},
+                )
+            )
+            self.invalidate()
+
+    def update_row(self, sheet_name: str, row: int, values: list[Any]) -> None:
+        with self._lock:
+            end_col = col_to_letter(len(values))
+            row_range = f"{quote_sheet_title(sheet_name)}!A{row}:{end_col}{row}"
+            request = (
+                self.service.spreadsheets()
+                .values()
+                .update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=row_range,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [values]},
+                )
+            )
+            self._execute(request)
+            self.invalidate()
 
     def invalidate(self) -> None:
         """Discard fallback snapshots and their active warnings."""

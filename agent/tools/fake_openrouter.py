@@ -1,24 +1,23 @@
 """
-Minimal stand-in for the OpenRouter API (OpenAI-compatible).
+Minimal stand-in for the 9Router gateway (OpenAI-compatible).
 
 Why: the Vision adapter should be testable end-to-end (HTTP, Bearer header,
-base64 images, JSON parsing, model filtering) without spending credits. This
+base64 images, JSON parsing, model filtering) without a real gateway. This
 server speaks just enough of the protocol:
 
-    GET  /api/v1/models            -> models with architecture.input_modalities
-    POST /api/v1/chat/completions  -> reads the prompt context and answers with
-                                      facts matching the expected caption/tags,
-                                      so a validation run can run offline
+    GET  /v1/models            -> models with owned_by + capabilities.vision/tools
+    POST /v1/chat/completions  -> reads the prompt context and answers with
+                                  facts matching the expected caption/tags,
+                                  so a validation run can run offline
 
 Run:
     python -m tools.fake_openrouter --port 20129
     python -m tools.fake_openrouter --port 20129 --violate   # drop a hashtag
 
 Then:
-    VISION_PROVIDER=openrouter \
-    OPENROUTER_BASE_URL=http://127.0.0.1:20129/api/v1 \
-    OPENROUTER_API_KEY=test-key \
-    OPENROUTER_MODEL=google/gemini-2.0-flash-001 \
+    NINEROUTER_BASE_URL=http://127.0.0.1:20129/v1 \
+    NINEROUTER_API_KEY=test-key \
+    NINEROUTER_MODEL=mamazon \
     python -m src.main vision-status --models 5 --test-image
 """
 
@@ -29,12 +28,12 @@ import json
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# id, name, input modalities, prompt price per token
+# id, owned_by, capabilities, context length
 MODELS = [
-    ("google/gemini-2.0-flash-001", "Google: Gemini 2.0 Flash", ["text", "image"], "0.0000001"),
-    ("openai/gpt-4o-mini", "OpenAI: GPT-4o mini", ["text", "image"], "0.00000015"),
-    ("anthropic/claude-3.5-sonnet", "Anthropic: Claude 3.5 Sonnet", ["text", "image"], "0.000003"),
-    ("meta-llama/llama-3.1-8b-instruct", "Meta: Llama 3.1 8B", ["text"], "0.00000006"),
+    ("mamazon", "combo", {"vision": True, "tools": True}, 1000000),
+    ("ag/gemini-3.8-flash", "ag", {"vision": True, "tools": True}, 1000000),
+    ("ag/claude-4.6-sonnet", "ag", {"vision": True, "tools": True}, 200000),
+    ("text-only-model", "ag", {"vision": False, "tools": True}, 32000),
 ]
 
 _CONTEXT_RE = re.compile(r"Task context:\s*(\{.*\})", re.DOTALL)
@@ -80,15 +79,11 @@ class Handler(BaseHTTPRequestHandler):
                 "data": [
                     {
                         "id": model_id,
-                        "name": name,
-                        "context_length": 128000,
-                        "architecture": {
-                            "input_modalities": modalities,
-                            "output_modalities": ["text"],
-                        },
-                        "pricing": {"prompt": price, "completion": price},
+                        "owned_by": owned_by,
+                        "capabilities": capabilities,
+                        "context_length": context_length,
                     }
-                    for model_id, name, modalities, price in MODELS
+                    for model_id, owned_by, capabilities, context_length in MODELS
                 ]
             },
         )
@@ -180,7 +175,7 @@ def _prompt_text(body: dict) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fake OpenRouter for offline testing")
+    parser = argparse.ArgumentParser(description="Fake 9Router gateway for offline testing")
     parser.add_argument("--port", type=int, default=20129)
     parser.add_argument("--violate", action="store_true", help="drop one hashtag")
     parser.add_argument("--api-key", default=None, help="require this Bearer token")
@@ -192,7 +187,7 @@ def main() -> None:
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.verbose = args.verbose  # type: ignore[attr-defined]
-    print(f"Fake OpenRouter listening on http://127.0.0.1:{args.port}/api/v1")
+    print(f"Fake 9Router listening on http://127.0.0.1:{args.port}/v1")
     print("models: " + ", ".join(model[0] for model in MODELS))
     try:
         server.serve_forever()

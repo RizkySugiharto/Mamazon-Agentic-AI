@@ -276,6 +276,18 @@ def best_name_match(query: str, candidates: Sequence[str], threshold: float = 0.
     return None, 0.0
 
 
+def find_ambiguous_names(
+    query: str, candidates: Sequence[str], threshold: float = 0.70, delta: float = 0.08
+) -> list[str]:
+    """Return matching candidate names if top candidates are ambiguously close."""
+    scored = [(c, name_similarity(query, c)) for c in candidates]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    valid = [pair for pair in scored if pair[1] >= threshold]
+    if len(valid) >= 2 and (valid[0][1] - valid[1][1]) <= delta:
+        return [pair[0] for pair in valid[:5]]
+    return []
+
+
 _MONTH_EXPAND = {
     "okt": "oktober", "jan": "januari", "feb": "februari", "mar": "maret",
     "apr": "april", "jun": "juni", "jul": "juli", "agu": "agustus",
@@ -417,6 +429,13 @@ def caption_similarity(a: str | None, b: str | None) -> float:
     if na == nb:
         return 1.0
     return round(SequenceMatcher(None, na, nb).ratio(), 4)
+
+
+def channel_mention(channel_id: str | int | None, fallback: str = "#blast-tugas") -> str:
+    """Format Discord channel ID as clickable mention <#id> or fallback text."""
+    raw = str(channel_id or "").strip()
+    return f"<#{raw}>" if raw.isdigit() else fallback
+
 
 
 def truncate(text: str | None, limit: int = 1000, suffix: str = "…") -> str:
@@ -606,3 +625,63 @@ def unique(items: Iterable[str]) -> list[str]:
             seen.add(key)
             out.append(item)
     return out
+
+
+# ─── Discord text & formatting ──────────────────────────────────────────────
+_TABLE_DIVIDER_RE = re.compile(r"^\s*\|?[\s:-]+(?:\|[\s:-]+)+\|?\s*$")
+
+
+def format_discord_message(text: str | None) -> str:
+    """Format AI text specifically for natural Discord presentation.
+
+    Discord does not support markdown tables (| col | col |).
+    This function converts markdown tables into clean Discord bullet lists
+    with bold headers, converts generic list dashes to '• ', and cleans artifacts.
+    """
+    if not text:
+        return ""
+    raw = str(text)
+    lines = raw.splitlines()
+    output: list[str] = []
+    i = 0
+    total = len(lines)
+
+    while i < total:
+        line = lines[i]
+        trimmed = line.strip()
+
+        # Check if line looks like markdown table header
+        if "|" in trimmed and i + 1 < total and _TABLE_DIVIDER_RE.match(lines[i + 1].strip()):
+            headers = [c.strip() for c in trimmed.split("|") if c.strip()]
+            i += 2  # skip header and divider
+            while i < total and "|" in lines[i].strip():
+                row_str = lines[i].strip()
+                if not row_str or _TABLE_DIVIDER_RE.match(row_str):
+                    i += 1
+                    continue
+                cells = [c.strip() for c in row_str.split("|") if c.strip()]
+                if not cells:
+                    i += 1
+                    continue
+                if len(cells) == 2 and headers and len(headers) >= 2:
+                    output.append(f"• **{cells[0]}:** {cells[1]}")
+                elif len(cells) >= 2:
+                    first = cells[0]
+                    rest = []
+                    for idx in range(1, len(cells)):
+                        h_name = headers[idx] if idx < len(headers) else f"Kolom {idx + 1}"
+                        rest.append(f"{h_name}: {cells[idx]}")
+                    details = " · ".join(rest)
+                    output.append(f"• **{first}** ({details})" if details else f"• **{first}**")
+                else:
+                    output.append(f"• {cells[0]}")
+                i += 1
+            continue
+
+        # Standardize markdown dashes/asterisks into clean bullet points
+        cleaned = re.sub(r"^\s*[-*]\s+", "• ", line)
+        output.append(cleaned)
+        i += 1
+
+    return "\n".join(output)
+

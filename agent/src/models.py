@@ -2,7 +2,8 @@
 Core data types shared by every module.
 
 Checks consume `VisionFacts` only, never raw images, so the validation logic is
-pure and unit-testable without Drive, Tencent or Discord.
+pure and unit-testable without Drive, Discord or a live AI provider
+(9Router / mock).
 """
 
 from __future__ import annotations
@@ -95,8 +96,9 @@ class VisionFacts:
     """
     Everything the checks need to know about a set of evidence screenshots.
 
-    Both MockVision and TencentVision must produce this shape. Unknown values
-    stay None so checks can return INCONCLUSIVE instead of guessing.
+Every Vision backend (MockVision, NineRouterVision)
+    produce this shape. Unknown values stay None so checks can return
+    INCONCLUSIVE instead of guessing.
     """
 
     image_count: int = 0
@@ -336,6 +338,8 @@ class BlastContext:
     extracted_at: datetime | None = None
     confidence: float = 0.0
     raw_message: str = ""
+    short_description: str = ""
+    search_tags: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -352,6 +356,8 @@ class BlastContext:
             "extracted_at": self.extracted_at.isoformat() if self.extracted_at else None,
             "confidence": self.confidence,
             "raw_message": self.raw_message,
+            "short_description": self.short_description,
+            "search_tags": self.search_tags,
         }
 
     @classmethod
@@ -380,6 +386,8 @@ class BlastContext:
             extracted_at=_dt(data.get("extracted_at")),
             confidence=float(data.get("confidence") or 0.0),
             raw_message=data.get("raw_message", ""),
+            short_description=str(data.get("short_description") or ""),
+            search_tags=list(data.get("search_tags") or []),
         )
 
 
@@ -495,3 +503,94 @@ class BlastRecord:
             channel_id=data.get("channel_id", ""),
             sent_chunks=int(data.get("sent_chunks") or 0),
         )
+
+
+# ─── Task Catalog & Merged Context ───────────────────────────────────────────
+@dataclass
+class TaskCatalogEntry:
+    """Task metadata read from markdown rules catalog."""
+
+    id: str
+    task_type: str = TaskType.PP
+    sheet: str | None = None
+    jadwal_post: str = ""
+    deadline: str = ""
+    platforms: list[str] = field(default_factory=list)
+    drive_link: str = ""
+    form_link: str = ""
+    tags: list[str] = field(default_factory=list)
+    hashtags: list[str] = field(default_factory=list)
+    caption: str = ""
+    story: dict[str, Any] = field(default_factory=dict)
+    feed: dict[str, Any] = field(default_factory=dict)
+    links: dict[str, Any] = field(default_factory=dict)
+    ketentuan: list[str] = field(default_factory=list)
+    custom_requirements: dict[str, Any] = field(default_factory=dict)
+    pembagian_per_divisi: dict[str, Any] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class MergedContext:
+    """Task catalog entry + blast_context, flattened for validation checks."""
+
+    task_id: str
+    task_type: str
+    raw_task: dict[str, Any] = field(default_factory=dict)
+    platforms: list[str] = field(default_factory=list)
+    jadwal_post: datetime | None = None
+    deadline: datetime | None = None
+    blast_date: datetime | None = None
+    caption_reference: str = ""
+    tags: list[str] = field(default_factory=list)
+    hashtags: list[str] = field(default_factory=list)
+    extra_hashtags: list[str] = field(default_factory=list)
+    keep_hours: int = 24
+    do_not_delete_until: datetime | None = None
+    blast: BlastContext | None = None
+    sources: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    form_link: str = ""
+    drive_link: str = ""
+
+    @property
+    def timing_consistent(self) -> bool:
+        """False when task data has deadline before the scheduled post."""
+        if not self.jadwal_post or not self.deadline:
+            return True
+        return self.deadline >= self.jadwal_post
+
+    @property
+    def is_story(self) -> bool:
+        return any(p.lower() == "story" for p in self.platforms)
+
+    @property
+    def is_feed(self) -> bool:
+        return any(p.lower() == "feed" for p in self.platforms)
+
+    @property
+    def expected_slides(self) -> int:
+        import re
+        block = self.raw_task.get("feed") or self.raw_task.get("story") or {}
+        media = str(block.get("media") or "")
+        numbers = [int(n) for n in re.findall(r"\b(\d{1,2})\b", media)]
+        if len(numbers) >= 2:
+            return max(numbers) - min(numbers) + 1
+        return 0
+
+    @property
+    def target_url(self) -> str:
+        return ((self.raw_task.get("links") or {}).get("target") or "")
+
+
+@dataclass
+class LintIssue:
+    severity: str      # ERROR | WARN | INFO
+    code: str
+    message: str
+    task_id: str | None = None
+
+    def __str__(self) -> str:
+        where = f"[{self.task_id}] " if self.task_id else ""
+        return f"{self.severity:5} {self.code:22} {where}{self.message}"
+

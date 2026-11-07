@@ -25,9 +25,11 @@ from .utils import (
     day_name_matches,
     extract_hashtags,
     extract_mentions,
+    fmt_dt,
     normalize_sheet_name,
     parse_dt,
     sheet_similarity,
+    truncate,
     wib_now,
 )
 
@@ -40,7 +42,7 @@ _DRIVE_RE = re.compile(r"https?://drive\.google\.com/[^\s,;<>\"']+", re.IGNORECA
 _FORM_RE = re.compile(
     r"https?://(?:forms\.gle|docs\.google\.com/forms)[^\s,;<>\"']+", re.IGNORECASE
 )
-_TASK_ID_RE = re.compile(r"\b(PP|BZ)-?(\d{1,2})\b", re.IGNORECASE)
+_TASK_ID_RE = re.compile(r"\b(PP|BZ)[-\s]?(\d{1,2})\b", re.IGNORECASE)
 
 
 @dataclass
@@ -58,6 +60,8 @@ class ParsedBlast:
     confidence: float = 0.0
     id_confidence: float = 0.0
     raw_message: str = ""
+    short_description: str = ""
+    search_tags: list[str] = field(default_factory=list)
 
     def to_context(self, message_id: str = "") -> BlastContext:
         return BlastContext(
@@ -74,6 +78,8 @@ class ParsedBlast:
             extracted_at=wib_now(),
             confidence=self.confidence,
             raw_message=self.raw_message,
+            short_description=self.short_description,
+            search_tags=self.search_tags,
         )
 
 
@@ -111,31 +117,155 @@ def _extract_field(text: str, *names: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def generate_next_task_id(task_type: str, existing_ids: Iterable[str]) -> str:
+    prefix = "BZ" if str(task_type or "").upper() == "BUZZER" else "PP"
+    highest = 0
+    pattern = re.compile(rf"\b{prefix}[-\s]?(\d{{1,2}})\b", re.IGNORECASE)
+    for raw in existing_ids:
+        for match in pattern.finditer(str(raw or "")):
+            try:
+                num = int(match.group(1))
+                if num > highest:
+                    highest = num
+            except ValueError:
+                pass
+    return f"{prefix}-{highest + 1:02d}"
+
+
+def extract_short_description(
+    text: str,
+    task_type: str,
+    deadline: datetime | None,
+    tags: list[str],
+    task_id: str | None = None,
+) -> str:
+    lowered = (text or "").lower()
+    detected_platforms: list[str] = []
+    if "story" in lowered:
+        detected_platforms.append("Story")
+    if "feed" in lowered:
+        detected_platforms.append("Feed")
+    if "reel" in lowered:
+        detected_platforms.append("Reels")
+    if "tiktok" in lowered:
+        detected_platforms.append("TikTok")
+    if "x.com" in lowered or "twitter" in lowered:
+        detected_platforms.append("X/Twitter")
+
+    if not detected_platforms:
+        detected_platforms = ["Story & Feed"] if task_type == "PP" else ["Instagram & TikTok"]
+
+    platform_str = " / ".join(detected_platforms)
+
+    sponsor = _extract_field(text or "", "sponsor", "target", "klien")
+    if not sponsor:
+        for tag in tags:
+            clean = tag.strip().lower()
+            if clean not in ("@horizon_umn", "@horizon.umn"):
+                sponsor = tag.strip()
+                break
+    if not sponsor:
+        first_line = (text or "").strip().splitlines()[0] if text else ""
+        if len(first_line) > 5 and not first_line.lower().startswith("blast"):
+            sponsor = truncate(first_line, 50)
+
+    deadline_str = fmt_dt(deadline) if deadline else "Belum ditentukan"
+    label = task_id or task_type
+    parts = [f"Tugas {label} ({platform_str})"]
+    if sponsor:
+        parts.append(f"• Target/Sponsor: {sponsor}")
+    parts.append(f"• Deadline: {deadline_str}")
+    return " ".join(parts)
+
+
+def extract_search_tags(
+    task_id: str | None,
+    task_type: str,
+    tags: list[str],
+    hashtags: list[str],
+    text: str,
+) -> list[str]:
+    results: list[str] = []
+    seen: set[str] = set()
+
+    def add(item: str) -> None:
+        val = item.strip()
+        if not val:
+            return
+        tag = val if val.startswith("#") else f"#{val}"
+        lower = tag.lower()
+        if lower not in seen:
+            seen.add(lower)
+            results.append(tag)
+
+    if task_id:
+        for code in re.findall(r"\b(PP|BZ)[-\s]?(\d{1,2})\b", task_id, re.IGNORECASE):
+            p, n = code[0].upper(), int(code[1])
+            add(f"{p}-{n:02d}")
+            add(f"{p}{n:02d}")
+
+    if task_type == "PP":
+        add("PP")
+        add("PaidPromote")
+    else:
+        add("Buzzer")
+        add("BZ")
+
+    lowered = (text or "").lower()
+    if "story" in lowered:
+        add("Story")
+    if "feed" in lowered:
+        add("Feed")
+    if "reel" in lowered:
+        add("Reels")
+    if "tiktok" in lowered:
+        add("TikTok")
+
+    for mention in tags:
+        clean = re.sub(r"[^\w]", "", mention)
+        if clean:
+            add(clean)
+
+    for h in hashtags:
+        clean = re.sub(r"^[#]+", "", h).strip()
+        if clean:
+            add(clean)
+
+    return results
+
+
 def _guess_task_id(
     text: str,
     parsed: ParsedBlast,
-    rulebase: dict[str, Any],
+    rulebase: dict[str, Any] | None,
     message_date: datetime | None,
 ) -> tuple[str | None, float]:
-    # 1. Explicit task id in the message.
-    match = _TASK_ID_RE.search(text)
-    if match:
-        prefix = match.group(1).upper()
-        number = int(match.group(2))
-        candidate = f"{prefix}-{number:02d}"
-        known = {
-            task.get("id")
-            for key in ("tugas_pp", "tugas_buzzer")
-            for task in rulebase.get(key, []) or []
-        }
-        if candidate in known:
-            return candidate, 0.95
+    # 1. Explicit task id(s) in the message.
+    matches = _TASK_ID_RE.findall(text)
+    if matches:
+        seen = set()
+        codes = []
+        for prefix, number in matches:
+            code = f"{prefix.upper()}-{int(number):02d}"
+            if code not in seen:
+                seen.add(code)
+                codes.append(code)
+        return " / ".join(codes), 0.95
 
+    rulebase = rulebase or {}
     tasks = [
         task
         for key in ("tugas_pp", "tugas_buzzer")
         for task in rulebase.get(key, []) or []
     ]
+    if not tasks:
+        try:
+            from .agent.knowledge import all_tasks
+            tasks = [t.raw for t in all_tasks()]
+        except Exception:
+            tasks = []
+    if not tasks:
+        return None, 0.0
 
     # 2. Form link equality — a form belongs to exactly one task.
     if parsed.form_link:
@@ -228,6 +358,7 @@ def parse_blast_message(
     text: str,
     rulebase: dict[str, Any] | None = None,
     message_date: datetime | None = None,
+    context_store: BlastContextStore | None = None,
 ) -> ParsedBlast:
     rulebase = rulebase or {}
     lines = str(text or "").splitlines()
@@ -260,7 +391,17 @@ def parse_blast_message(
         parsed.notes.append(note_text)
 
     task_id, id_confidence = _guess_task_id(text or "", parsed, rulebase, message_date)
+    if not task_id and context_store is not None:
+        task_id = generate_next_task_id(parsed.task_type, context_store.all().keys())
+        id_confidence = 0.80
     parsed.task_id = task_id
+
+    parsed.short_description = extract_short_description(
+        text or "", parsed.task_type, parsed.deadline, parsed.tags, parsed.task_id
+    )
+    parsed.search_tags = extract_search_tags(
+        parsed.task_id, parsed.task_type, parsed.tags, parsed.hashtags, text or ""
+    )
 
     # Confidence: how much of the context we actually recovered.
     fields = [

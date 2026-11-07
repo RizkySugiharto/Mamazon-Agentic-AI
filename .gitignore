@@ -20,6 +20,8 @@ agent/output/*.json
 agent/output/*.md
 agent/output/blasts/
 agent/tmp/
+agent/logs/
+logs/
 !agent/output/.gitkeep
 !agent/tmp/.gitkeep
 
@@ -34,3 +36,6 @@ Thumbs.db
 
 # Workbuddy AI
 .workbuddy-ai/
+
+# Local vector store + embedding model cache
+agent/data/

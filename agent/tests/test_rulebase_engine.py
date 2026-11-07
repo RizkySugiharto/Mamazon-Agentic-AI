@@ -8,7 +8,8 @@ import pytest
 
 from src.data_layer import AngelEntry
 from src.models import BlastContext, CheckStatus, ResultStatus, Submission, VisionFacts
-from src.rulebase_engine import RulebaseEngine, lint_rulebase
+from src.validator import TaskEngineAdapter as RulebaseEngine
+from src.agent.evaluator import lint_rulebase
 
 
 def make_submission(**overrides) -> Submission:

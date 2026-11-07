@@ -23,7 +23,7 @@ cd agent
 
 uv sync                      # creates agent/.venv + uv.lock from pyproject.toml
 
-uv run python -m src.main config          # wiring check
+uv run python -m src.main config          # wiring check (incl. unified AI provider)
 uv run python -m src.main lint            # rulebase data issues
 uv run python -m src.main google-status   # service account, Sheets, Drive
 uv run python -m src.main demo            # offline demo (mock vision/drive)
@@ -38,7 +38,6 @@ Common operations:
 ```bash
 uv add <package>              # add a dependency (updates pyproject + uv.lock)
 uv remove <package>           # remove one
-uv sync --extra tencent       # optional Tencent Hunyuan SDK
 uv run --with rich python …   # one-off tool without changing the project
 uv lock --upgrade             # refresh the lockfile
 ```
@@ -55,7 +54,7 @@ uv run python -m src.main demo          # blast extract + 3 sheets + recap
 ```
 
 The demo runs entirely on the mock Vision backend and mock Drive, so it works
-without OpenRouter or Google credentials.
+without any AI-provider or Google credentials.
 
 ## Connecting the real services
 
@@ -68,12 +67,11 @@ Fill in what you have; each adapter falls back independently:
 | Variable | Effect when set |
 | --- | --- |
 | `DISCORD_BOT_TOKEN`, `DISCORD_GUILD_ID`, `DISCORD_*_CHANNEL_ID` | bot goes live (all 17 slash commands) |
-| `OPENROUTER_MODEL` | `VISION_PROVIDER=auto` switches to OpenRouter |
-| `TENCENT_SECRET_ID`, `TENCENT_SECRET_KEY` | `VISION_PROVIDER=auto` switches to Hunyuan Vision |
+| `AI_PROVIDER` (+ `OPENROUTER_MODEL` / `OPENCODE_MODEL` / `OPENCODE_API_MODEL`) | selects the one provider + model used for both Vision and chat (`openrouter`, `opencode`, or `opencode-api`) |
 | `agent/config/service_account.json` | `DRIVE_PROVIDER=auto` switches to real Drive downloads |
 
-Force a backend explicitly with `VISION_PROVIDER=mock|openrouter|tencent` and
-`DRIVE_PROVIDER=mock|google`. Then:
+Set `AI_PROVIDER=openrouter|opencode|opencode-api` (or `mock` for offline
+tests only) and force the Drive backend with `DRIVE_PROVIDER=mock|google`. Then:
 
 ```bash
 cd agent && uv run python -m src.discord_bot
@@ -81,21 +79,69 @@ cd agent && uv run python -m src.discord_bot
 
 Without a token the bot exits with a checklist instead of crashing.
 
-### Vision via OpenRouter (recommended)
+### Unified AI provider (Vision + chat)
+
+One setting, `AI_PROVIDER`, chooses the model used for **both** evidence
+screenshot reading (Vision) and `#ai-chat` conversation. The same provider and
+the same exact model serve both paths — there is no separate chat model.
+Supported production values are `openrouter | opencode | opencode-api`;
+`mock` is an internal/offline-test-only stub, not a production provider. The
+Tencent / Hunyuan and Antigravity / `agy` provider options were **removed** —
+setting any of them now fails loudly instead of falling back silently. The
+three real backends keep **distinct** model variables: `OPENROUTER_MODEL`,
+`OPENCODE_MODEL` and `OPENCODE_API_MODEL` are not interchangeable. Provider
+failures now surface a **sanitized reason** in the chat fallback and the audit
+log — never a key, token or raw provider payload.
+
+| `AI_PROVIDER` | Backend | Model setting |
+| --- | --- | --- |
+| `openrouter` | [OpenRouter](https://openrouter.ai) OpenAI-compatible endpoint (stdlib-only, no SDK) | `OPENROUTER_MODEL` |
+| `opencode` | local OpenCode CLI, headless `opencode run` | `OPENCODE_MODEL` |
+| `opencode-api` | OpenCode Console inference HTTP API (OpenAI-compatible endpoint) | `OPENCODE_API_MODEL` |
+| `mock` | deterministic offline stub | — (internal/offline-test only, **not** a production provider) |
+
+Get a model before starting: for the local CLI run `opencode models` and copy
+one exact `provider/model` slug; for `opencode-api` list models with
+`GET https://opencode.ai/inference/v1/models` and create an API key in the
+OpenCode Console. For `opencode-api`, use the **bare id** from that listing
+(e.g. `nemotron-3.5-super-vl-free`); an `opencode/<id>` value is also accepted
+and is normalized to the bare id before the direct API call. Neither path
+guesses a default model, and the model must be vision-capable for screenshot
+reading.
+
+Legacy names (`VISION_PROVIDER`, `AI_AGENT_PROVIDER`, `CHAT_PROVIDER`,
+`CHAT_MODEL`) are ignored as separate selectors; they survive only as
+backward-compatible mirrors/aliases of `AI_PROVIDER` and never select a
+different provider or model. Do not set them — use `AI_PROVIDER` and the
+provider's own `*_MODEL` variable instead. Restart the bot after changing `.env`.
+
+`CHAT_ENABLED=false` only disables chat rewriting in `#ai-chat` (answers fall
+back to deterministic grounded facts); it does **not** disable Vision/evidence
+reading. `CHAT_TIMEOUT` and `CHAT_MAX_TOKENS` likewise only affect chat.
+
+#### OpenRouter
 
 [OpenRouter](https://openrouter.ai) exposes 450+ models behind one
-OpenAI-compatible endpoint, so the agent never needs a Tencent account. The
-adapter is stdlib-only — no extra Python dependency, no SDK to install.
+OpenAI-compatible endpoint. The adapter is stdlib-only — no extra Python
+dependency, no SDK to install.
+
+```dotenv
+# 1. create an API key: https://openrouter.ai/keys
+# 2. put these in agent/.env
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=google/gemma-4-26b-a4b-it:free   # example only — keep the model you configured
+```
+
+`OPENROUTER_MODEL` is used for both Vision and chat, so it **must** accept image
+input for screenshot reading. The id above is an example that preserves the
+configured free model; the agent keeps exactly the model you set and never
+silently substitutes a different or paid one. Model ids are `provider/model`
+(e.g. `google/gemini-2.0-flash-001`, `openai/gpt-4o-mini`,
+`anthropic/claude-3.5-sonnet`). Cheap vision models are usually enough — the
+task is reading text from a screenshot, not reasoning about it.
 
 ```bash
-# 1. create an API key
-#    https://openrouter.ai/keys   (credits: https://openrouter.ai/credits)
-
-# 2. put it in agent/.env
-VISION_PROVIDER=openrouter
-OPENROUTER_API_KEY=sk-or-v1-...
-OPENROUTER_MODEL=google/gemini-2.0-flash-001   # must accept image input
-
 # 3. find a vision model + check it works before touching real data
 cd agent
 uv run python -m src.main vision-status --models 20
@@ -108,11 +154,6 @@ uv run python -m src.main validate --sheet "PP 29 Oktober" --limit 3 --force
 per 1M tokens, so you never pick a text-only model or an expensive one by
 accident. The listing works **without** a key because OpenRouter's `/models`
 endpoint is public.
-
-Model ids are `provider/model` (e.g. `openai/gpt-4o-mini`,
-`anthropic/claude-3.5-sonnet`, `google/gemini-2.0-flash-001`). Cheap vision
-models are usually enough — the task is reading text from a screenshot, not
-reasoning about it.
 
 | Symptom | Meaning | Fix |
 | --- | --- | --- |
@@ -134,21 +175,139 @@ expected caption/tags, so the whole pipeline can be exercised offline:
 
 ```bash
 uv run python -m tools.fake_openrouter --port 20129          # add --violate to trigger C6
-VISION_PROVIDER=openrouter OPENROUTER_BASE_URL=http://127.0.0.1:20129/api/v1 \
+AI_PROVIDER=openrouter OPENROUTER_BASE_URL=http://127.0.0.1:20129/api/v1 \
 OPENROUTER_API_KEY=test-key OPENROUTER_MODEL=google/gemini-2.0-flash-001 \
 DRIVE_PROVIDER=mock uv run python -m src.main validate --sheet "PP 29 Oktober" --limit 3
 ```
 
-### Vision via Tencent Cloud (alternative)
+#### Local OpenCode CLI
 
-```bash
-VISION_PROVIDER=tencent
-TENCENT_SECRET_ID=...
-TENCENT_SECRET_KEY=...
-TENCENT_REGION=ap-jakarta
+Use a locally installed OpenCode CLI. There is **no guessed default model**: run
+`opencode models` and copy one exact `provider/model` slug into
+`OPENCODE_MODEL`. That model serves both Vision and chat, so for screenshots it
+**must be vision-capable** — evidence images are attached to the prompt with
+repeated `--file <image>` flags.
+
+```dotenv
+AI_PROVIDER=opencode
+OPENCODE_CLI=opencode                 # Windows: absolute ...\opencode.CMD path
+OPENCODE_MODEL=provider/model          # exact slug from `opencode models`
+OPENCODE_TIMEOUT=120
+OPENCODE_AGENT=plan
+OPENCODE_CWD=                          # blank = agent/tmp/opencode_ai (isolated, no .env)
+OPENCODE_MAX_IMAGES=8
+OPENCODE_MAX_PROMPT_CHARS=12000
 ```
 
-Same `VisionFacts` contract, same checks — only the transport differs.
+The bot invokes the documented headless form (one `--file` per image):
+
+```bash
+opencode run --model <OPENCODE_MODEL> --agent plan --file <image> "<prompt>"
+```
+
+Invocation safeguards:
+
+- resolves the executable to an **absolute path** via `shutil.which` — on
+  Windows this yields the real `opencode.CMD`, fixing `WinError 2` /
+  `FileNotFoundError` when a bare `opencode` name cannot be spawned;
+- built as an **argument list** with `shell=False` — no shell, no string
+  interpolation of untrusted content, and **no `--auto`** flag;
+- `OPENCODE_CWD` blank or relative is resolved to an isolated **absolute**
+  directory under `agent/tmp` (`agent/tmp/opencode_ai` by default); it must not
+  contain a `.env`, so the local CLI cannot read project secrets;
+- read-only `plan` agent, with no permission bypass such as
+  `--dangerously-skip-permissions`;
+- all untrusted chat content (user messages, history, grounded facts) is
+  JSON-encoded as data, never concatenated into instructions;
+- the configured provider/model is **never silently switched**;
+- on a missing CLI, unauthenticated session, timeout, malformed output or an
+  ungrounded answer, chat falls back **visibly** to the deterministic grounded
+  facts rather than another provider.
+
+#### OpenCode API (HTTP, distinct from the local CLI)
+
+`opencode-api` calls the official OpenAI-compatible HTTP endpoint. It is
+**HTTP/API-based and different from the local `opencode` CLI** above: no binary
+is run on this machine, no local `opencode models` lookup happens, and it uses
+its own `OPENCODE_API_*` variables plus a Bearer API key.
+
+```dotenv
+AI_PROVIDER=opencode-api
+OPENCODE_API_BASE_URL=https://opencode.ai/inference/openai/v1
+OPENCODE_API_KEY=                  # API key from the OpenCode Console
+OPENCODE_API_MODEL=                # bare id from GET /inference/v1/models; no guessed default
+OPENCODE_API_USER_AGENT=MamazonSpadeAgent/1.0 (+OpenCode-API)
+OPENCODE_API_SESSION_ID=           # optional x-opencode-session header
+OPENCODE_API_TIMEOUT=90
+OPENCODE_API_MAX_IMAGES=8
+OPENCODE_API_MAX_TOKENS=3000
+```
+
+Fixed request behaviour:
+
+- `OPENCODE_API_BASE_URL` accepts either the **base** URL or a pasted **full**
+  `.../chat/completions` URL; the code strips the suffix back to a single base
+  before appending it, so both forms work.
+- `OPENCODE_API_MODEL` accepts either a **bare id** or `opencode/<id>`; the
+  `opencode/` prefix is **normalized to the bare id** for the direct API (see
+  `config.effective_opencode_api_model`). Copy ids from
+  `GET https://opencode.ai/inference/v1/models`. No default is guessed.
+- Every request sends a custom `OPENCODE_API_USER_AGENT` plus `Accept`, and the
+  optional `OPENCODE_API_SESSION_ID` as `x-opencode-session`. This is required
+  because Python's default `urllib` User-Agent is rejected by Cloudflare with
+  **403 error 1010**.
+- The configured model is **never silently switched** to a paid one; on a
+  missing key, timeout, malformed response or ungrounded answer, chat falls
+  back visibly to deterministic grounded facts (with a sanitized reason) rather
+  than another provider or model.
+
+**Free models vs. the external API.** Official docs say free-tier models whose
+id ends in `-free` (e.g. `nemotron-3.5-super-vl-free`) work **only inside
+OpenCode**; external API harnesses get **403 / 429 `FreeUsageLimitError`**. For
+`opencode-api`, use a **paid or Go model** — point `OPENCODE_API_BASE_URL` at
+`https://opencode.ai/inference/go/openai/v1` — or use the free model through
+`AI_PROVIDER=opencode` (local CLI). The agent never silently upgrades a free
+model to a paid one; `ai-status` reports a warning instead.
+
+Vision sends evidence screenshots as base64 `image_url` data-URL parts, so the
+configured model **must be vision-capable**. The same endpoint, headers and
+exact model serve **both** Vision and chat.
+
+#### Check the active setting
+
+```bash
+cd agent
+uv run python -m src.main ai-status
+uv run python -m src.main config
+```
+
+`ai-status` works for all three providers (`openrouter`, `opencode`,
+`opencode-api`): it reports the unified provider, exact model, the local CLI
+path or API base URL, and any configuration issues without sending a prompt.
+It also emits **non-blocking warnings** (for example a `-free` model on the
+external API, a normalized `opencode/<id>` model, or a missing CLI path).
+Warnings are advisory: `ai-status` still reports **OK** when nothing is
+blocking, so a warning alone does not mean the provider is broken.
+`vision-status` diagnoses the active Vision backend, and `config` prints the
+wiring check, including the active `AI_PROVIDER` and its model. For
+`opencode-api`, model discovery uses `GET https://opencode.ai/inference/v1/models`
+as described above. `chat-status` remains a backward-compatible alias for
+`ai-status`.
+
+#### Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `403` Cloudflare **error 1010** on `opencode-api` | Python's default `urllib` User-Agent is blocked | A custom `OPENCODE_API_USER_AGENT` is now sent on every request — verify its value (default `MamazonSpadeAgent/1.0 (+OpenCode-API)`). `Accept` and optional `x-opencode-session` are also set. |
+| `429` / `FreeUsageLimitError` on `opencode-api` | a free `-free` model is blocked for external API harnesses (official docs: free models work only inside OpenCode) | Use a **paid or Go model** (`https://opencode.ai/inference/go/openai/v1`) for `AI_PROVIDER=opencode-api`, or run the free model through `AI_PROVIDER=opencode` (local CLI). The agent never switches to a paid model silently. |
+| `model not found` on `opencode-api` | wrong id format | Use the **bare id** from `GET https://opencode.ai/inference/v1/models`; an `opencode/<id>` prefix is normalized to the bare id automatically. |
+| CLI `WinError 2` / `FileNotFoundError` on Windows | a bare `opencode` name cannot be spawned | Set `OPENCODE_CLI` to the **absolute** `.../opencode.CMD` path (e.g. `C:/Users/<you>/AppData/Roaming/npm/opencode.CMD`); the resolver uses `shutil.which` to the real executable. |
+| `OPENCODE_CWD` contains a `.env` (or is relative) | the local CLI could read project secrets | Leave `OPENCODE_CWD` **blank** (defaults to isolated `agent/tmp/opencode_ai`) or set an absolute isolated directory. Blank/relative values are resolved to an absolute path under `agent/tmp`. |
+| `ai-status` shows warnings but still `OK` | warnings are non-blocking advisories (free model, normalized id, missing CLI path) | Read the warning text; the provider is still usable. Fix only what the warning names. |
+
+All provider failures (auth, quota, timeout, malformed output) appear in the
+chat fallback and the audit log as **sanitized reasons** — no keys, tokens or
+raw provider payloads are ever exposed.
 
 ### Google Sheets (live) + Google Drive (evidence)
 
@@ -255,6 +414,8 @@ uv run python -m src.main ketentuan --task PP-03
 uv run python -m src.main scan-blast --demo
 uv run python -m src.main bukti --caption "PP 29 Oktober | @budi_ | Story 24h masih live"
 uv run python -m src.main vision-status --models 20 --test-image   # diagnose the Vision backend
+uv run python -m src.main ai-status                   # unified provider + non-blocking warnings (OK if only warnings)
+uv run python -m src.main config                     # wiring check, incl. active AI field
 uv run python -m src.main cleanup                     # 24h TTL sweep of tmp/images
 ```
 
@@ -278,21 +439,33 @@ Commands: `/help` `/validate` `/blast` `/hold-blast` `/release-blast` `/list-act
 `/audit-log` `/ketentuan-pp` `/ketentuan-buzzer` `/ketentuan-angel-card`
 `/scan-blast` `/list-sheets`.
 
+`/help` shows the active AI field (provider + exact model + status/warnings);
+from the CLI, `ai-status` / `chat-status` report the same, including
+non-blocking warnings. Chat failures now include a sanitized reason in the
+fallback answer and the audit log.
+
 Passive listeners: `#blast-tugas` is parsed automatically (✅ reaction + reply),
 `#bukti-tambahan` accepts `Submission | @ig | Deskripsi` uploads, `#ai-chat`
-supports natural Indonesian conversation, greetings and lightweight emotional acknowledgment.
-It uses the configured OpenRouter model and key (`CHAT_MODEL` defaults to
-`OPENROUTER_MODEL`, including `google/gemma-4-26b-a4b-it:free`), grounded in
-read-only rulebase and current organization data. Set `CHAT_ENABLED=false` for
-offline deterministic answers. On timeout, quota failure or empty model output,
-it visibly falls back to grounded answers. Recent context is kept per guild,
+supports natural Indonesian conversation, greetings and lightweight emotional
+acknowledgment, plus the bounded agent tools described in **Agent tools and
+confirmed execution** below. It uses the active unified `AI_PROVIDER` model
+(OpenRouter, local OpenCode CLI, or OpenCode API), grounded in read-only rulebase
+and current organization data. Set `CHAT_ENABLED=false` for offline deterministic
+answers (this only disables chat rewriting, not Vision). On timeout, quota
+failure or empty model output it visibly falls back to grounded answers and now
+shows a **sanitized reason** (no secrets). Recent context is kept per guild,
 channel and member (12 turns, 30-minute inactivity expiry, at most 100 sessions),
 not persisted or shared between members. Only validator roles retain chat access.
-Chat cannot execute validations, change rules/fines or send blasts.
+Chat never executes arbitrary code; any mutating/expensive action must be
+confirmed through an explicit Discord button with the same role gate and audit
+entry (see below).
 
 ### New interactive commands
 
-- `/help`: private, role-aware command guide and clear action boundaries.
+- `/help`: private, role-aware command guide and clear action boundaries. It
+  also shows the active **AI field** — the unified `AI_PROVIDER`, its exact
+  model and current status/warnings — so a member can see which backend is
+  answering.
 - `/denda-list nama:...`: every active fine is paginated, with sheet/blast task
   name, rule explanation, observed failure, amount, per-task subtotal and running
   member accumulation. Without `nama`, privileged users see all members; panitia
@@ -325,6 +498,48 @@ workers. Pending/manual-review/error results cannot create new fines; previously
 flagged unsent charges become withdrawn on pending/exempt revalidation. Already
 blasted charges remain for coordinator review rather than being erased.
 
+## Agent tools and confirmed execution
+
+`#ai-chat` exposes a small, bounded toolkit — **no LangChain and no arbitrary
+code execution**. Everything is enabled by `CHAT_TOOLS_ENABLED` (default `true`)
+and obeys the same role gates as the equivalent slash commands.
+
+Explicit tool commands (Indonesian):
+
+| Command | What it does |
+| --- | --- |
+| `ingat <fakta>` / `catat <fakta>` | store an explicit long-term memory fact for the calling member |
+| `lihat ingatan` / `recall` | read back stored facts |
+| `lupa semua` / `forget` | clear the member's stored facts |
+| `hitung <ekspresi>` | safe arithmetic only (a parsed calculator, not `eval`) |
+| `cari aturan <query>` | search the local rulebase |
+| `cari web <query>` | optional web search, **only** when `WEB_SEARCH_URL` is configured |
+| `status ai` | report the active provider/model and non-blocking warnings |
+
+Short-term conversation memory already exists (12 turns, per guild/channel/
+member). Long-term memory is explicit and opt-in per member, persisted to
+`agent/output/chat_memory.json` (`CHAT_MEMORY_PATH`), capped by
+`CHAT_MEMORY_MAX_ITEMS` (default 20) and toggled by `CHAT_MEMORY_ENABLED`. Web
+search additionally needs `WEB_SEARCH_URL` and optionally `WEB_SEARCH_API_KEY`
+(sent as a Bearer token); `WEB_SEARCH_TIMEOUT` and `WEB_SEARCH_MAX_RESULTS`
+bound it. Without `WEB_SEARCH_URL`, `cari web` replies that search is not
+configured and never falls back to a live provider.
+
+Read-only data access in chat: with the **same role gates** as the slash
+commands, chat can surface denda members, the Angel Card registry, Google Sheets
+metadata/headers/sample rows, task overview, audit log, resubmit status and
+`ketentuan`. `DISCORD_MEMBER_MAP` still gates private panitia fine data by
+immutable Discord user ID — an unbound panitia is denied rather than trusted by
+nickname.
+
+Mutating / expensive commands (`validate`, `blast`, `add-angel`, `remove-angel`,
+`scan-blast`, `hold-blast`, `release-blast`) are **never** run just because a
+user typed them. Chat only prepares an explicit **Discord confirmation button**;
+the action runs after the button is pressed, under the same role gate and with
+an audit-log entry. `blast` still **only creates a draft** — sending to `#denda`
+always requires koor approval through the existing approval button. There is no
+arbitrary code execution anywhere in the chat path.
+
 ## Pipeline
 
 ```
@@ -334,7 +549,7 @@ sheet query ─▶ resolve sheet (structure-aware fuzzy)
             ─▶ Angel Card check (beli ≤ blast → EXEMPT)
             ─▶ dedupe resubmits (latest timestamp wins)
             ─▶ download evidence (hash dedup, compress, 403 → review)
-            ─▶ VisionFacts (mock | Hunyuan)
+            ─▶ VisionFacts (mock | OpenRouter | OpenCode CLI | OpenCode API)
             ─▶ checks C1–C10 / B1–B7
             ─▶ verification_report.csv · violations_log.csv · audit_log.jsonl · blast_draft.md
             ─▶ Discord: summary + paginated detail + #evidence
@@ -349,7 +564,7 @@ sheet query ─▶ resolve sheet (structure-aware fuzzy)
 | `sheets_client.py` | `XlsxSource` / `GoogleSheetsSource`, serial dates, discovery |
 | `data_layer.py` | sheet reader (either source), sheet resolver, roster, Angel registry, dedupe |
 | `rulebase_engine.py` | merge + 17 checks + Angel exemption + `lint_rulebase` |
-| `vision_checker.py` | `MockVision` (deterministic), `OpenRouterVision` (OpenAI-compatible), `TencentVision` |
+| `vision_checker.py` | `MockVision` (deterministic); `OpenRouterVision`, `OpenCodeVision` (local CLI) and the `opencode-api` HTTP adapter — all selected by the unified `AI_PROVIDER`; `UnavailableVision` |
 | `drive_client.py` | `MockDrive` (synthetic images, 403 simulation) and `GoogleDrive` |
 | `image_manager.py` | download, SHA-256 dedup, compression, TTL cleanup |
 | `output_generator.py` | CSV upserts, blast draft, audit log, blast state machine |
@@ -358,7 +573,7 @@ sheet query ─▶ resolve sheet (structure-aware fuzzy)
 | `evidence_vault.py` | violation entries, recurring escalation |
 | `validator.py` | orchestrator + reporting helpers |
 | `discord_bot.py` | commands, embeds, buttons, role gating |
-| `chat_agent.py` | grounded read-only facts + OpenRouter conversation, scope guard and bounded user history |
+| `chat_agent.py` | grounded read-only facts + unified OpenRouter / OpenCode CLI / OpenCode API conversation, scope guard and bounded user history |
 
 ## Outputs
 

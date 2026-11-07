@@ -32,9 +32,39 @@ from .models import (
     ValidationBatch,
     ValidationResult,
     VisionFacts,
+    LintIssue,
+    MergedContext,
 )
 from .output_generator import OUTPUT_LOCK, OutputGenerator
-from .rulebase_engine import LintIssue, MergedContext, RulebaseEngine, lint_rulebase
+from .agent.evaluator import (
+    applicable_checks,
+    check_angel_exemption,
+    check_denda,
+    check_meta,
+    denda_breakdown,
+    evaluate_with_agent,
+    lint_rules,
+    merge_task_context,
+    summary_line,
+    _eval_c1,
+    _eval_c2,
+    _eval_c3,
+    _eval_c4,
+    _eval_c5,
+    _eval_c6,
+    _eval_c7,
+    _eval_c8,
+    _eval_c9,
+    _eval_c10,
+    _eval_b1,
+    _eval_b2,
+    _eval_b3,
+    _eval_b4,
+    _eval_b5,
+    _eval_b6,
+    _eval_b7,
+)
+from .agent import knowledge
 from .utils import (
     handle_similarity,
     normalize_handle,
@@ -80,29 +110,186 @@ class _ValidationCancelled(Exception):
     pass
 
 
+class TaskEngineAdapter:
+    """Adapter providing task catalog & rule evaluation without rulebase.json."""
+
+    def __init__(
+        self,
+        rulebase_or_blast: Any = None,
+        blast_context: dict[str, BlastContext] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if isinstance(rulebase_or_blast, dict) and blast_context is not None:
+            self.blast_context = blast_context
+        elif isinstance(rulebase_or_blast, dict) and any(isinstance(v, BlastContext) for v in rulebase_or_blast.values()):
+            self.blast_context = rulebase_or_blast
+        else:
+            self.blast_context = blast_context or {}
+
+    def merge(self, task_id: str | None) -> MergedContext:
+        return merge_task_context(task_id, self.blast_context)
+
+    def task(self, task_id: str | None) -> dict[str, Any] | None:
+        t = knowledge.get_task(task_id or "")
+        if not t:
+            return None
+        d = {"id": t.id, "sheet": t.sheet, "task_type": t.task_type}
+        d.update(t.raw)
+        return d
+
+    def task_ids(self, task_type: str | None = None) -> list[str]:
+        return knowledge.all_task_ids(task_type)
+
+    def all_tasks(self) -> list[dict[str, Any]]:
+        result = []
+        for t in knowledge.all_tasks():
+            d = {"id": t.id, "sheet": t.sheet, "task_type": t.task_type}
+            d.update(t.raw)
+            result.append(d)
+        return result
+
+    def check_meta(self, check_id: str) -> dict[str, Any]:
+        return check_meta(check_id)
+
+    def check_denda(self, check_id: str) -> int:
+        return check_denda(check_id)
+
+    def applicable_checks(self, task_id: str | None) -> list[str]:
+        return applicable_checks(task_id)
+
+    def angel_exemption(
+        self,
+        nama: str,
+        task_id: str | None,
+        registry: Sequence[Any],
+        blast_date: datetime | None = None,
+    ) -> tuple[bool, str]:
+        return check_angel_exemption(nama, task_id, registry, blast_date)
+
+    def evaluate(
+        self,
+        submission: Submission,
+        task_id: str | None,
+        facts: VisionFacts,
+        story_note: str | None = None,
+        extra_warnings: Sequence[str] | None = None,
+    ) -> ValidationResult:
+        return evaluate_with_agent(
+            submission,
+            task_id,
+            facts,
+            story_note=story_note,
+            extra_warnings=extra_warnings,
+            blast_context=self.blast_context,
+        )
+
+    def _check_c1(self, sub, merged, facts, story_note=None):
+        return _eval_c1(sub, merged, facts, story_note)
+
+    def _check_c2(self, sub, merged, facts, story_note=None):
+        return _eval_c2(sub, merged, facts, story_note)
+
+    def _check_c3(self, sub, merged, facts, story_note=None):
+        return _eval_c3(sub, merged, facts, story_note)
+
+    def _check_c4(self, sub, merged, facts, story_note=None):
+        return _eval_c4(sub, merged, facts, story_note)
+
+    def _check_c5(self, sub, merged, facts, story_note=None):
+        return _eval_c5(sub, merged, facts, story_note)
+
+    def _check_c6(self, sub, merged, facts, story_note=None):
+        return _eval_c6(sub, merged, facts, story_note)
+
+    def _check_c7(self, sub, merged, facts, story_note=None):
+        return _eval_c7(sub, merged, facts, story_note)
+
+    def _check_c8(self, sub, merged, facts, story_note=None):
+        return _eval_c8(sub, merged, facts, story_note)
+
+    def _check_c9(self, sub, merged, facts, story_note=None):
+        return _eval_c9(sub, merged, facts, story_note)
+
+    def _check_c10(self, sub, merged, facts, story_note=None):
+        return _eval_c10(sub, merged, facts, story_note)
+
+    def _check_b1(self, sub, merged, facts, story_note=None):
+        return _eval_b1(sub, merged, facts, story_note)
+
+    def _check_b2(self, sub, merged, facts, story_note=None):
+        return _eval_b2(sub, merged, facts, story_note)
+
+    def _check_b3(self, sub, merged, facts, story_note=None):
+        return _eval_b3(sub, merged, facts, story_note)
+
+    def _check_b4(self, sub, merged, facts, story_note=None):
+        return _eval_b4(sub, merged, facts, story_note)
+
+    def _check_b5(self, sub, merged, facts, story_note=None):
+        return _eval_b5(sub, merged, facts, story_note)
+
+    def _check_b6(self, sub, merged, facts, story_note=None):
+        return _eval_b6(sub, merged, facts, story_note)
+
+    def _check_b7(self, sub, merged, facts, story_note=None):
+        return _eval_b7(sub, merged, facts, story_note)
+
+    def denda_breakdown(self, result: ValidationResult) -> list[tuple[str, int, str]]:
+        return denda_breakdown(result)
+
+    def summary_line(self, result: ValidationResult) -> str:
+        return summary_line(result)
+
+    @property
+    def rulebase(self) -> dict[str, Any]:
+        fines = knowledge.load_fines_policy()
+        angel = knowledge.load_angel_policy()
+        checks_pp = [self.check_meta(f"C{i}") for i in range(1, 11)]
+        checks_buzzer = [self.check_meta(f"B{i}") for i in range(1, 8)]
+        return {
+            "denanda_denda": {
+                **fines.get("denda", {}),
+                "rekening": {
+                    **fines.get("rekening", {}),
+                    "angel_card": {"harga": angel.get("harga", 100000)},
+                },
+                "kode_transfer": fines.get("kode_transfer", {}),
+                "deadline_bayar": fines.get("deadline_bayar", ""),
+            },
+            "angel_card": angel,
+            "checks_pp": checks_pp,
+            "checks_buzzer": checks_buzzer,
+            "tugas_pp": [self.task(tid) for tid in self.task_ids("PP")],
+            "tugas_buzzer": [self.task(tid) for tid in self.task_ids("BUZZER")],
+        }
+
+
 # ─── Validator ──────────────────────────────────────────────────────────────
 class Validator:
     def __init__(
         self,
         data_layer: DataLayer | None = None,
-        engine: RulebaseEngine | None = None,
+        engine: Any = None,
         vision=None,
         images: ImageManager | None = None,
         outputs: OutputGenerator | None = None,
         blast_context: dict[str, BlastContext] | None = None,
     ) -> None:
-        self.rulebase = _load_rulebase()
-        self.data = data_layer or DataLayer(rulebase=self.rulebase)
+        self.data = data_layer or DataLayer()
         self.blast_context = (
             blast_context if blast_context is not None else load_contexts()
         )
-        self.engine = engine or RulebaseEngine(self.rulebase, self.blast_context)
+        self.engine = engine or TaskEngineAdapter(self.blast_context)
         self.engine.blast_context = self.blast_context
         self.vision = vision or build_vision_backend()
         self.images = images or ImageManager()
         self.outputs = outputs or OutputGenerator()
         # Different task workers share a Drive client/image index and Vision client.
         self._adapter_lock = RLock()
+
+    @property
+    def rulebase(self) -> dict[str, Any]:
+        return self.engine.rulebase
 
     # ── helpers ────────────────────────────────────────────────────────────
     def reload_context(self) -> dict[str, BlastContext]:
@@ -111,7 +298,7 @@ class Validator:
         return self.blast_context
 
     def lint(self) -> list[LintIssue]:
-        return lint_rulebase(self.rulebase)
+        return lint_rules()
 
     def _resolve_sheet(self, query: str) -> tuple[str, Any]:
         resolution = self.data.resolve_sheet(query)
@@ -305,6 +492,20 @@ class Validator:
                         if submission.file_ids
                         else []
                     )
+                    # Fallback to direct web / Instagram post scraping if Drive download has no images
+                    if not images and submission.links:
+                        from .web_scraper import extract_instagram_post, is_safe_url
+                        for link in submission.links:
+                            if is_safe_url(link):
+                                scraped = extract_instagram_post(link)
+                                if scraped.local_image_path:
+                                    images.append(
+                                        DownloadedImage(
+                                            file_id=link,
+                                            path=str(scraped.local_image_path),
+                                            mime_type="image/jpeg",
+                                        )
+                                    )
                 checkpoint()
                 failures = [image.error for image in images if image.error]
                 if failures:
@@ -320,6 +521,20 @@ class Validator:
                     checkpoint()
                     facts = self.vision.analyze(images, hints)
                 checkpoint()
+
+                # If vision extracted no caption but web scraping obtained live post text, enrich facts
+                if not facts.caption_text and any(
+                    "instagram.com" in link or "instagr.am" in link for link in submission.links
+                ):
+                    from .web_scraper import extract_instagram_post
+                    for link in submission.links:
+                        if "instagram.com" in link or "instagr.am" in link:
+                            scraped = extract_instagram_post(link)
+                            if scraped.caption:
+                                facts.caption_text = scraped.caption
+                                if scraped.author and not facts.ig_username_seen:
+                                    facts.ig_username_seen = scraped.author
+                                break
 
                 story_note = self._story_note(submission, bukti_index, facts)
                 result = self.engine.evaluate(
@@ -531,10 +746,8 @@ def _filter_division(
 
 
 def _load_rulebase() -> dict[str, Any]:
-    path = Path(config.RULEBASE_PATH)
-    if not path.exists():
-        raise FileNotFoundError(f"Rulebase not found: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    """Compatibility stub."""
+    return {}
 
 
 def _emit(
@@ -551,6 +764,10 @@ def _sheet_mentions(candidate: str, sheet_name: str) -> bool:
     from .utils import sheet_similarity
 
     return sheet_similarity(candidate, sheet_name) >= 0.9
+
+
+# Compatibility alias
+RulebaseEngine = TaskEngineAdapter
 
 
 def _apply_anomalies(result: ValidationResult, facts: VisionFacts) -> None:

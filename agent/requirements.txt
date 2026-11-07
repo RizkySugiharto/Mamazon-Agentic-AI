@@ -19,8 +19,5 @@ google-api-python-client>=2.100.0
 google-auth>=2.25.0
 google-auth-oauthlib>=1.1.0
 
-# Tencent Hunyuan Vision (optional at runtime — mock backend works without it)
-tencentcloud-sdk-python>=3.0.700
-
 # Tests
 pytest>=8.0.0

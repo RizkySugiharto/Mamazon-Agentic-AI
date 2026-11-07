@@ -27,17 +27,23 @@ from .data_layer import DataLayer
 from .image_manager import ImageManager
 from .models import ResultStatus
 from .output_generator import OutputGenerator
-from .rulebase_engine import RulebaseEngine
 from .utils import format_rupiah, fmt_dt, truncate
-from .validator import SheetAmbiguousError, SheetNotFoundError, Validator, _load_rulebase
+from .validator import SheetAmbiguousError, SheetNotFoundError, Validator
+from .agent.evaluator import (
+    applicable_checks,
+    check_angel_exemption,
+    lint_rules,
+    merge_task_context,
+)
+from .agent import knowledge
 
 
 def _rulebase() -> dict:
-    return _load_rulebase()
+    return {}
 
 
 def _data_layer() -> DataLayer:
-    return DataLayer(rulebase=_rulebase())
+    return DataLayer()
 
 
 def _validator() -> Validator:
@@ -73,11 +79,9 @@ def cmd_list_sheets(args: argparse.Namespace) -> int:
 
 
 def cmd_lint(args: argparse.Namespace) -> int:
-    from .rulebase_engine import lint_rulebase
-
-    issues = lint_rulebase(_rulebase())
+    issues = lint_rules()
     if not issues:
-        print("Rulebase bersih, tidak ada isu.")
+        print("Aturan markdown bersih, tidak ada isu.")
         return 0
     for issue in issues:
         print(issue)
@@ -85,7 +89,6 @@ def cmd_lint(args: argparse.Namespace) -> int:
     warns = sum(1 for issue in issues if issue.severity == "WARN")
     print()
     print(f"{len(issues)} isu: {errors} ERROR, {warns} WARN, {len(issues) - errors - warns} INFO")
-    print("Catatan: rulebase.json TIDAK diubah. Perbaiki manual oleh developer.")
     return 0 if errors == 0 else 1
 
 
@@ -235,7 +238,6 @@ def cmd_angel_card(args: argparse.Namespace) -> int:
             return 0
 
         if args.check:
-            engine = RulebaseEngine(_rulebase())
             entry, score = data.find_person(args.check)
             name = entry.nama if entry else args.check
             match = next(
@@ -249,7 +251,7 @@ def cmd_angel_card(args: argparse.Namespace) -> int:
             print(f"   Dibeli      : {fmt_dt(match.tanggal_beli, with_time=False)}")
             print(f"   Catatan     : {match.catatan}")
             for task_id in ("PP-03", "PP-05", "BZ-06", "BZ-03"):
-                exempt, note = engine.angel_exemption(name, task_id, registry)
+                exempt, note = check_angel_exemption(name, task_id, registry)
                 print(f"   {task_id:6} -> {'EXEMPT' if exempt else 'TIDAK'}  {note}")
             return 0
 
@@ -293,18 +295,18 @@ def cmd_denda(args: argparse.Namespace) -> int:
 
 
 def cmd_ketentuan(args: argparse.Namespace) -> int:
-    engine = RulebaseEngine(_rulebase())
-    merged = engine.merge(args.task)
+    merged = merge_task_context(args.task)
     if not merged.raw_task:
         print(f"❌ Task '{args.task}' tidak ditemukan.")
-        print("Tersedia: " + ", ".join(engine.task_ids()))
+        print("Tersedia: " + ", ".join(knowledge.all_task_ids()))
         return 2
 
     print(f"📋 {merged.task_id} — {merged.task_type}")
+    print("Channel     : #blast-tugas")
     print(f"Platform    : {', '.join(merged.platforms) or '-'}")
     print(f"Jadwal post : {fmt_dt(merged.jadwal_post)}")
     print(f"Deadline    : {fmt_dt(merged.deadline)}")
-    print(f"Checks      : {', '.join(engine.applicable_checks(args.task))}")
+    print(f"Checks      : {', '.join(applicable_checks(args.task))}")
     if merged.tags:
         print(f"Tags wajib  : {', '.join(merged.tags)}")
     if merged.hashtags:
@@ -437,32 +439,33 @@ def cmd_demo(args: argparse.Namespace) -> int:
 
 
 def cmd_vision_status(args: argparse.Namespace) -> int:
-    """Diagnose the Vision backend — the fastest way to debug OpenRouter."""
-    from .vision_checker import (
-        OpenRouterVision,
-        TencentVision,
-        UnavailableVision,
-        build_vision_backend,
-    )
+    """Diagnose the 9Router gateway used for screenshot reading and chat."""
+    from .vision_checker import NineRouterVision, UnavailableVision, build_vision_backend
 
     backend = build_vision_backend()
-    print("=== Vision backend ===")
-    print(f"provider      : {config.VISION_PROVIDER} (active: {backend.name})")
-    print(f"mock mode     : {config.USE_MOCK_VISION}")
+    status = config.ai_provider_status()
+    print("=== Vision backend (9Router) ===")
+    print(f"provider      : {config.AI_PROVIDER} (active: {backend.name})")
+    print(f"model/combo   : {status['model'] or '-'}")
+    print(f"chat rewriting: {'on' if config.CHAT_ENABLED else 'off'}")
+    print(f"offline mode  : {'on (mock, deterministic)' if config.USE_MOCK_VISION else 'off'}")
     print(f"min followers : {config.MIN_IG_FOLLOWERS}")
+    for warning in list(status.get("warnings") or []):
+        print(f"warning       : {truncate(warning, 220)}")
 
     if isinstance(backend, UnavailableVision):
         print(f"\n❌ {backend.reason}")
-        print("\nPilihan:")
-        print("  • Pakai OpenRouter: set VISION_PROVIDER=openrouter + OPENROUTER_MODEL")
-        print("  • Pakai mock  : set VISION_PROVIDER=mock (untuk demo offline)")
+        print("\nSatu-satunya backend adalah 9Router:")
+        print("  • NINEROUTER_BASE_URL (default http://localhost:20128/v1)")
+        print("  • NINEROUTER_API_KEY  (dari dashboard 9Router)")
+        print("  • NINEROUTER_MODEL   (model id atau nama combo, default: mamazon)")
+        print("  • Offline: AI_OFFLINE=true (demo/test only)")
         return 1
 
-    if isinstance(backend, OpenRouterVision):
+    if isinstance(backend, NineRouterVision):
         print(f"base url      : {backend.base_url}")
-        print(f"model         : {backend.model or '(kosong!)'}")
         print(f"api key       : {'SET' if backend.api_key else 'KOSONG'}")
-        print(f"json mode     : {config.OPENROUTER_JSON_MODE}")
+        print(f"json mode     : {config.NINEROUTER_JSON_MODE}")
         print(f"timeout       : {backend.timeout}s")
         print()
 
@@ -471,24 +474,27 @@ def cmd_vision_status(args: argparse.Namespace) -> int:
 
         if args.models:
             try:
-                vision_models = backend.list_vision_models()
-                total = len(backend.list_models())
+                entries = backend.list_model_entries()
+                vision = [m for m in entries if m["vision"]]
+                combos = [m for m in entries if m["combo"]]
                 print(
-                    f"\n{len(vision_models)} model vision dari {total} model "
-                    "(difilter: input_modalities mengandung 'image')"
+                    f"\n{len(vision)} vision-capable dari {len(entries)} entri "
+                    f"({len(combos)} combo)"
                 )
-                for model in vision_models[: args.models]:
+                for model in vision[: args.models]:
                     mark = "→" if model["id"] == backend.model else " "
-                    price = model.get("prompt_price")
-                    price_text = (
-                        f"${float(price) * 1_000_000:.2f}/1M tok" if price else "gratis/?"
-                    )
-                    print(f"  {mark} {model['id']:52} {price_text}")
+                    tags = []
+                    if model["combo"]:
+                        tags.append("combo")
+                    if model["tools"]:
+                        tags.append("tools")
+                    tag_text = f" [{','.join(tags)}]" if tags else ""
+                    print(f"  {mark} {model['id']}{tag_text}")
             except Exception as exc:
-                print(f"\n❌ gagal list model: {exc}")
+                print(f"\n❌ gagal list model: {truncate(str(exc), 200)}")
 
         if args.test_image:
-            print("\nMengirim 1 gambar uji ke model…")
+            print("\nMengirim 1 gambar uji ke gateway…")
             path = _make_test_image()
             passed, detail, payload = backend.smoke_test(path)
             print(f"{'✅' if passed else '❌'} vision test: {detail}")
@@ -503,26 +509,12 @@ def cmd_vision_status(args: argparse.Namespace) -> int:
 
         return 0 if ok else 1
 
-    if isinstance(backend, TencentVision):
-        print(f"secret id     : {'SET' if config.TENCENT_SECRET_ID else 'kosong'}")
-        print(f"region        : {config.TENCENT_REGION}")
-        print(f"model         : {config.TENCENT_VISION_MODEL}")
-        print("\nUntuk pindah ke OpenRouter:")
-        print("  1. buat key di https://openrouter.ai/keys")
-        print("  2. set VISION_PROVIDER=openrouter, OPENROUTER_API_KEY, OPENROUTER_MODEL")
-        print("  3. python -m src.main vision-status --models 20 --test-image")
-        return 0
-
     print("\nMock Vision aktif — hasil deterministik, bukan dari model sungguhan.")
-    print("\nUntuk memakai OpenRouter:")
-    print("  1. buat API key di https://openrouter.ai/keys")
-    print("  2. di agent/.env:")
-    print("       VISION_PROVIDER=openrouter")
-    print("       OPENROUTER_API_KEY=sk-or-v1-...")
-    print("       OPENROUTER_MODEL=google/gemini-2.0-flash-001")
-    print("  3. python -m src.main vision-status --models 20 --test-image")
-    print("\nModel harus multimodal — daftar model vision ada di langkah 3.")
+    print("\nUntuk memakai 9Router:")
+    print("  NINEROUTER_BASE_URL + NINEROUTER_API_KEY + NINEROUTER_MODEL")
+    print("\nModel/combo harus vision-capable untuk pembacaan bukti.")
     return 0
+
 
 
 def _make_test_image() -> str:
@@ -653,10 +645,7 @@ def cmd_google_status(args: argparse.Namespace) -> int:
 
             # Only task tabs are mandatory; registry tabs (Bukti Tambahan,
             # Evidence Vault) are optional in a given workbook.
-            expected = set()
-            for task in validator_rulebase().get("tugas_pp", []) + validator_rulebase().get("tugas_buzzer", []):
-                if task.get("sheet"):
-                    expected.add(task["sheet"].strip().lower())
+            expected = {t.sheet.strip().lower() for t in knowledge.all_tasks() if t.sheet}
             actual = {name.strip().lower() for name in names}
             missing = sorted(expected - actual)
             if missing:
@@ -678,9 +667,9 @@ def cmd_google_status(args: argparse.Namespace) -> int:
     print("\n--- Google Drive ---")
     folder_input = args.folder
     if not folder_input:
-        for task in validator_rulebase().get("tugas_pp", []):
-            if task.get("drive_link"):
-                folder_input = task["drive_link"]
+        for task in knowledge.all_tasks():
+            if task.drive_link:
+                folder_input = task.drive_link
                 break
     folder_id = extract_drive_folder_id(folder_input)
 
@@ -754,7 +743,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     else:
         print(f"Dataset      : {config.DUMMY_DATA_PATH}")
     print(f"Output       : {config.OUTPUT_DIR}")
-    print(f"Vision       : {config.VISION_PROVIDER}")
+    ai_status = config.ai_provider_status()
+    print(f"AI provider  : {ai_status['provider']} (Vision + chat)")
+    print(f"AI model     : {ai_status['model'] or '-'}")
+    print(f"AI chat      : {'on' if ai_status['chat_enabled'] else 'off'}")
     print(f"Drive        : {config.DRIVE_PROVIDER}")
     print(f"Discord token: {'SET' if config.DISCORD_BOT_TOKEN else 'NOT SET'}")
     problems = config.validate_config(require_discord=args.discord)
@@ -763,6 +755,79 @@ def cmd_config(args: argparse.Namespace) -> int:
         print("Issues:")
         for problem in problems:
             print(f"  - {problem}")
+        return 1
+    print("OK")
+    return 0
+
+
+def cmd_kb_build(args: argparse.Namespace) -> int:
+    """(Re)build the local zvec knowledge base from rulebase + config."""
+    from src.agent import knowledge
+
+    store = knowledge.build_store(force=args.force)
+    docs = knowledge.build_corpus()
+    kinds: dict[str, int] = {}
+    for doc in docs:
+        kinds[doc["metadata"]["kind"]] = kinds.get(doc["metadata"]["kind"], 0) + 1
+    print("=== Knowledge base (zvec) ===")
+    print(f"path     : {config.VECTOR_DB_DIR / config.VECTOR_DB_COLLECTION}")
+    print(f"model    : {config.EMBEDDING_MODEL} (dim {config.EMBEDDING_DIM})")
+    print(f"indexed  : {store.count()} doc")
+    for kind in sorted(kinds):
+        print(f"  {kind:8s}: {kinds[kind]}")
+    print(f"fresh    : {knowledge.is_fresh()}")
+    return 0
+
+
+def cmd_kb_status(args: argparse.Namespace) -> int:
+    """Report the knowledge base state without rebuilding it."""
+    from src.agent import knowledge
+
+    if not knowledge.is_fresh():
+        print("STALE: rulebase/config berubah sejak indeks terakhir dibuat.")
+        print("Jalankan `python -m src.main kb-build` untuk menyegarkan.")
+    try:
+        store = knowledge.open_store()
+    except Exception as exc:
+        print(f"❌ {truncate(str(exc), 200)}")
+        return 1
+    print(f"indexed: {store.count()} doc (fingerprint {'OK' if knowledge.is_fresh() else 'STALE'})")
+    return 0
+
+
+def cmd_kb_search(args: argparse.Namespace) -> int:
+    """Test hybrid retrieval over the knowledge base."""
+    from src.agent import knowledge
+
+    results = knowledge.search(args.query, top_k=args.top)
+    if not results:
+        print("Tidak ada hasil di atas ambang skor.")
+        return 1
+    for doc, score in results:
+        print(f"{score:6.3f}  [{doc.metadata.get('id', '?')}]")
+        print(f"        {truncate(doc.page_content, 110)}")
+    return 0
+
+
+def cmd_ai_status(args: argparse.Namespace) -> int:
+    status = config.ai_provider_status()
+    print("=== Unified AI provider (Vision + chat) ===")
+    print(f"provider      : {status['provider']}")
+    print(f"model/combo   : {status['model'] or '-'}")
+    print(f"chat rewriting: {'on' if status['chat_enabled'] else 'off'}")
+    print(f"base url      : {status['api_base_url']}")
+    print(f"api key       : {'SET' if status['api_key_set'] else 'KOSONG'}")
+    print(f"offline mode  : {'on' if status.get('offline') else 'off'}")
+    warnings = list(status.get("warnings") or [])
+    if warnings:
+        print("\nWarnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+    issues = list(status["issues"])
+    if issues:
+        print("\nIssues:")
+        for issue in issues:
+            print(f"  - {issue}")
         return 1
     print("OK")
     return 0
@@ -813,7 +878,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("demo", help="demo end-to-end (blast + 3 sheet + rekap)")
     p.set_defaults(func=cmd_demo)
 
-    p = sub.add_parser("vision-status", help="diagnosa backend Vision (openrouter/tencent/mock)")
+    p = sub.add_parser("vision-status", help="diagnosa AI provider untuk Vision (9router/mock)")
     p.add_argument("--models", type=int, default=0, help="tampilkan N model dari /v1/models")
     p.add_argument("--test-image", action="store_true", help="kirim gambar uji ke model")
     p.set_defaults(func=cmd_vision_status)
@@ -836,6 +901,28 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("config", help="cek konfigurasi & env")
     p.add_argument("--discord", action="store_true", help="wajibkan token + channel id")
     p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("ai-status", help="cek 9Router (Vision + chat)")
+    p.set_defaults(func=cmd_ai_status)
+
+    # Backwards-compatible command name; it now reports the unified provider.
+    p = sub.add_parser("chat-status", help="alias untuk ai-status")
+    p.set_defaults(func=cmd_ai_status)
+
+    p = sub.add_parser(
+        "kb-build",
+        help="(re)bangun basis pengetahuan zvec: aturan, command, info yang boleh dibagikan",
+    )
+    p.add_argument("--force", action="store_true", help="bangun ulang walau fingerprint sama")
+    p.set_defaults(func=cmd_kb_build)
+
+    p = sub.add_parser("kb-status", help="statistik basis pengetahuan (jumlah doc per kind)")
+    p.set_defaults(func=cmd_kb_status)
+
+    p = sub.add_parser("kb-search", help="uji pencarian hybrid (vector + FTS) di basis pengetahuan")
+    p.add_argument("query", help="pertanyaan uji, mis. 'berapa denda caption salah'")
+    p.add_argument("--top", type=int, default=5, help="jumlah hasil (default 5)")
+    p.set_defaults(func=cmd_kb_search)
 
     return parser
 

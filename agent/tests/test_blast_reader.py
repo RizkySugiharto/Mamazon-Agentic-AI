@@ -95,6 +95,28 @@ class TestParse:
         # The client's own note is kept verbatim for the koor to read.
         assert any("verbatim" in note for note in parsed.notes)
 
+    def test_parse_without_rulebase(self):
+        text = "BLAST TUGAS PP-05\nDeadline: 27 Oktober 2026 12:00\nTags: @sponsor_id\nHashtag: #Promo"
+        parsed = parse_blast_message(text, rulebase=None)
+        assert parsed.task_id == "PP-05"
+        assert "Tugas PP-05" in parsed.short_description
+        assert "#PP-05" in parsed.search_tags
+        assert "#sponsor_id" in parsed.search_tags
+        assert "#Promo" in parsed.search_tags
+
+    def test_multi_task_id_extracted(self):
+        text = "BLAST TUGAS: PP-03 / PP-05\nDeadline: 28 Oktober 2026 15:00"
+        parsed = parse_blast_message(text, rulebase=None)
+        assert parsed.task_id == "PP-03 / PP-05"
+        assert "#PP-03" in parsed.search_tags
+        assert "#PP-05" in parsed.search_tags
+
+    def test_generate_next_task_id(self):
+        from src.blast_reader import generate_next_task_id
+        assert generate_next_task_id("PP", ["PP-01", "PP-02"]) == "PP-03"
+        assert generate_next_task_id("BUZZER", ["BZ-01"]) == "BZ-02"
+        assert generate_next_task_id("PP", []) == "PP-01"
+
 
 class TestStore:
     def test_roundtrip(self, tmp_path, rulebase):
@@ -108,6 +130,8 @@ class TestStore:
         assert reloaded.blast_message_id == "999"
         assert reloaded.deadline == datetime(2026, 10, 29, 15, 0)
         assert reloaded.caption_referensi.startswith("Pusing")
+        assert reloaded.short_description
+        assert len(reloaded.search_tags) > 0
 
     def test_remove(self, tmp_path, rulebase):
         store = BlastContextStore(tmp_path / "ctx.json")

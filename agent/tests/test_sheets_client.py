@@ -16,6 +16,7 @@ from src.sheets_client import (
     SheetRateLimitError,
     SheetSourceError,
     XlsxSource,
+    col_to_letter,
     extract_spreadsheet_id,
     quote_sheet_title,
     serial_to_datetime,
@@ -52,6 +53,28 @@ class FakeValues:
         request = FakeRequest(
             {"values": self.sheets.get(title, [])}, error=self.errors.get(title)
         )
+        self.requests.append(request)
+        return request
+
+    def append(self, **kwargs):
+        range_value = kwargs.get("range", "")
+        title = range_value.rsplit("!", 1)[0].strip("'").replace("''", "'")
+        body = kwargs.get("body", {})
+        values = body.get("values", [])
+        if title not in self.sheets:
+            self.sheets[title] = []
+        for row in values:
+            self.sheets[title].append(list(row))
+        self.calls.append(f"append:{title}")
+        request = FakeRequest({"updates": {"updatedRows": len(values)}}, error=self.errors.get("append"))
+        self.requests.append(request)
+        return request
+
+    def update(self, **kwargs):
+        range_value = kwargs.get("range", "")
+        body = kwargs.get("body", {})
+        self.calls.append(f"update:{range_value}")
+        request = FakeRequest({"updatedCells": 1}, error=self.errors.get("update"))
         self.requests.append(request)
         return request
 
@@ -601,3 +624,61 @@ class TestDataLayerWithSheets:
             assert len(layer.read_submissions("PP 29 Oktober")) == 42
         finally:
             layer.close()
+
+    def test_col_to_letter_mapping(self):
+        assert col_to_letter(1) == "A"
+        assert col_to_letter(3) == "C"
+        assert col_to_letter(26) == "Z"
+        assert col_to_letter(27) == "AA"
+        assert col_to_letter(28) == "AB"
+        assert col_to_letter(52) == "AZ"
+        assert col_to_letter(53) == "BA"
+
+    def test_google_sheets_mutation_methods(self):
+        service = FakeService(["Registry"], {"Registry": [["Name", "Status"]]})
+        source = GoogleSheetsSource("x" * 30, service=service)
+        # Prime cache
+        assert source.rows("Registry") == [["Name", "Status"]]
+
+        # Append row
+        source.append_row("Registry", ["Alice", "ACTIVE"])
+        assert "append:Registry" in service.values.calls
+        assert source._snapshots == {}  # Invalidation verified
+
+        # Fresh read includes appended row
+        rows = source.rows("Registry")
+        assert rows == [["Name", "Status"], ["Alice", "ACTIVE"]]
+
+        # Update cell
+        source.update_cell("Registry", 2, 2, "INACTIVE")
+        assert any("update:'Registry'!B2" in c for c in service.values.calls)
+        assert source._snapshots == {}
+
+        # Update row
+        source.update_row("Registry", 2, ["Alice", "REMOVED"])
+        assert any("update:'Registry'!A2:B2" in c for c in service.values.calls)
+        assert source._snapshots == {}
+
+    def test_xlsx_source_mutation(self, tmp_path):
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "TestTab"
+        ws.append(["Col1", "Col2"])
+        wb_path = tmp_path / "test_sheet.xlsx"
+        wb.save(wb_path)
+        wb.close()
+
+        source = XlsxSource(wb_path)
+        assert source.rows("TestTab") == [["Col1", "Col2"]]
+
+        source.append_row("TestTab", ["Val1", "Val2"])
+        assert source.rows("TestTab") == [["Col1", "Col2"], ["Val1", "Val2"]]
+
+        source.update_cell("TestTab", 2, 2, "UpdatedVal")
+        assert source.rows("TestTab") == [["Col1", "Col2"], ["Val1", "UpdatedVal"]]
+
+        source.update_row("TestTab", 2, ["NewRow1", "NewRow2"])
+        assert source.rows("TestTab") == [["Col1", "Col2"], ["NewRow1", "NewRow2"]]
+        source.close()
+

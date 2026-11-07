@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from unittest.mock import Mock
 
 import pytest
@@ -67,7 +68,7 @@ class TestTaskMapping:
     def test_rulebase_sheet_wins(self, data: DataLayer):
         task = data.resolve_task("PP Feed 26 Oktober")
         assert task.task_id == "PP-03"
-        assert task.source == "rulebase"
+        assert task.source in ("rules", "rulebase")
 
     def test_config_fallback(self, data: DataLayer):
         task = data.resolve_task("PP 29 Oktober")
@@ -314,3 +315,169 @@ class TestDedupe:
         kept, notes = dedupe_submissions(rows)
         assert len(kept) == 1
         assert "submitted 5x" in notes[0]
+
+
+class MockMutableSource:
+    name = "mock"
+    label = "mock-sheet"
+
+    def __init__(self, sheets: dict[str, list[list]]):
+        self.sheets = sheets
+        self.appended = []
+        self.updated = []
+
+    def sheet_names(self):
+        return list(self.sheets)
+
+    def rows(self, sheet_name):
+        return [list(r) for r in self.sheets.get(sheet_name, [])]
+
+    def append_row(self, sheet_name, values):
+        if sheet_name not in self.sheets:
+            self.sheets[sheet_name] = []
+        self.sheets[sheet_name].append(list(values))
+        self.appended.append((sheet_name, values))
+
+    def update_cell(self, sheet_name, row, col, value):
+        self.sheets[sheet_name][row - 1][col - 1] = value
+        self.updated.append((sheet_name, row, col, value))
+
+    def invalidate(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class TestAngelCardAndSheetMutations:
+    def test_add_angel_card_new_entry(self):
+        headers = ["Nama Lengkap", "Divisi", "Status Angel Card", "Tanggal Pembelian", "Bukti Transfer", "Catatan Validasi"]
+        initial_rows = [headers, ["Budi", "Conan", "ACTIVE", "2026-10-01", "", ""]]
+        source = MockMutableSource({"Angel Card Registry": initial_rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        layer.add_angel_card("Sari", divisi="Spade", tanggal_beli=datetime(2026, 10, 5), status="ACTIVE", catatan="via test")
+        assert len(source.appended) == 1
+        registry = layer.load_angel_registry()
+        assert len(registry) == 2
+        sari = next(r for r in registry if r.nama == "Sari")
+        assert sari.divisi == "Spade"
+        assert sari.active is True
+        assert sari.catatan == "via test"
+
+    def test_add_angel_card_reactivates_existing(self):
+        headers = ["Nama Lengkap", "Divisi", "Status Angel Card", "Tanggal Pembelian", "Bukti Transfer", "Catatan Validasi"]
+        initial_rows = [headers, ["Budi", "Conan", "INACTIVE", "2026-10-01", "", ""]]
+        source = MockMutableSource({"Angel Card Registry": initial_rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        layer.add_angel_card("Budi", divisi="Conan", tanggal_beli=datetime(2026, 10, 8), status="ACTIVE", catatan="reactivated")
+        assert len(source.appended) == 0  # Updated in-place
+        registry = layer.load_angel_registry()
+        budi = registry[0]
+        assert budi.status == "ACTIVE"
+        assert budi.active is True
+        assert budi.tanggal_beli.date() == datetime(2026, 10, 8).date()
+
+    def test_remove_angel_card_soft_deletes(self):
+        headers = ["Nama Lengkap", "Divisi", "Status Angel Card", "Tanggal Pembelian", "Bukti Transfer", "Catatan Validasi"]
+        initial_rows = [headers, ["Budi", "Conan", "ACTIVE", "2026-10-01", "", "initial"]]
+        source = MockMutableSource({"Angel Card Registry": initial_rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        ok = layer.remove_angel_card("Budi", catatan="koor request")
+        assert ok is True
+        registry = layer.load_angel_registry()
+        budi = registry[0]
+        assert budi.status == "INACTIVE"
+        assert budi.active is False
+        assert "koor request" in budi.catatan
+
+    def test_remove_angel_card_not_found(self):
+        headers = ["Nama Lengkap", "Divisi", "Status Angel Card", "Tanggal Pembelian", "Bukti Transfer", "Catatan Validasi"]
+        initial_rows = [headers, ["Budi", "Conan", "ACTIVE", "2026-10-01", "", ""]]
+        source = MockMutableSource({"Angel Card Registry": initial_rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        ok = layer.remove_angel_card("Nonexistent Person")
+        assert ok is False
+
+    def test_append_bukti_tambahan(self):
+        headers = ["Timestamp", "Submission", "Username Instagram", "Deskripsi", "Link Bukti", "PJ"]
+        source = MockMutableSource({"Bukti Tambahan": [headers]})
+        layer = DataLayer(source=source, rulebase={})
+
+        layer.append_bukti_tambahan({
+            "timestamp": "2026-10-29 10:00:00",
+            "submission": "PP Feed 26 Oktober",
+            "ig": "@test_user",
+            "deskripsi": "Story still live",
+            "link": "https://example.com/drive",
+            "pj": "spade_pj",
+        })
+        assert len(source.appended) == 1
+        rows = layer.load_bukti_tambahan()
+        assert len(rows) == 1
+        assert rows[0]["submission"] == "PP Feed 26 Oktober"
+        assert rows[0]["ig"] == "@test_user"
+
+
+class TestRosterDiscordId:
+    def test_load_roster_parses_column_e_discord_id(self):
+        headers = ["Nama Lengkap", "NIM", "Divisi", "Username Instagram", "Discord User ID"]
+        rows = [headers, ["Budi Santoso", "12345", "Spade", "budig", "100200300400500600"]]
+        source = MockMutableSource({"Roster Panitia": rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        roster = layer.load_roster()
+        assert len(roster) == 1
+        assert roster[0].nama == "Budi Santoso"
+        assert roster[0].discord_id == "100200300400500600"
+
+    def test_update_roster_discord_set_and_clear(self):
+        headers = ["Nama Lengkap", "NIM", "Divisi", "Username Instagram", "Discord User ID"]
+        rows = [headers, ["Budi Santoso", "12345", "Spade", "budig", ""]]
+        source = MockMutableSource({"Roster Panitia": rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        entry, old_id = layer.update_roster_discord("Budi Santoso", "999888777666")
+        assert entry.discord_id == "999888777666"
+        assert old_id == ""
+        assert source.updated[-1] == ("Roster Panitia", 2, 5, "999888777666")
+
+        entry_cleared, old_id2 = layer.update_roster_discord("Budi Santoso", "")
+        assert entry_cleared.discord_id == ""
+        assert old_id2 == "999888777666"
+        assert source.updated[-1] == ("Roster Panitia", 2, 5, "")
+
+    def test_resolve_discord_user_column_e_and_fallback(self, monkeypatch):
+        from src import config
+        monkeypatch.setattr(config, "DISCORD_MEMBER_MAP", {"55555": "Sari Melati"})
+
+        headers = ["Nama Lengkap", "NIM", "Divisi", "Username Instagram", "Discord User ID"]
+        rows = [
+            headers,
+            ["Budi Santoso", "12345", "Spade", "budig", "11111"],
+            ["Sari Melati", "67890", "Conan", "sarig", ""],
+        ]
+        source = MockMutableSource({"Roster Panitia": rows})
+        layer = DataLayer(source=source, rulebase={})
+
+        resolved_budi = layer.resolve_discord_user("11111")
+        assert resolved_budi is not None
+        assert resolved_budi.nama == "Budi Santoso"
+
+        # Mention format <@11111>
+        resolved_mention = layer.resolve_discord_user("<@11111>")
+        assert resolved_mention is not None
+        assert resolved_mention.nama == "Budi Santoso"
+
+        # Fallback to DISCORD_MEMBER_MAP
+        resolved_sari = layer.resolve_discord_user("55555")
+        assert resolved_sari is not None
+        assert resolved_sari.nama == "Sari Melati"
+
+        # Unknown user
+        assert layer.resolve_discord_user("99999") is None
+
+

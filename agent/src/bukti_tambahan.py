@@ -170,6 +170,11 @@ class BuktiTambahanHandler:
             "link": link,
             "pj": pj or actor,
         }
+        if hasattr(self.data, "append_bukti_tambahan"):
+            try:
+                self.data.append_bukti_tambahan(entry)
+            except Exception:
+                pass
         append_bukti(entry, self.path)
 
         return BuktiResult(
@@ -194,7 +199,4 @@ class BuktiTambahanHandler:
 
 
 def _rulebase() -> dict[str, Any]:
-    try:
-        return json.loads(config.RULEBASE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+    return {}

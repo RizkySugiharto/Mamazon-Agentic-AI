@@ -426,13 +426,11 @@ class OutputGenerator:
 
     def _rekening_from_rulebase(self) -> str:
         try:
-            rulebase = json.loads(config.RULEBASE_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return ""
-        rek = (rulebase.get("denanda_denda") or {}).get("rekening") or {}
-        if not rek:
-            return ""
-        return f"{rek.get('bank', '')} {rek.get('nomor', '')} a.n. {rek.get('atas_nama', '')}".strip()
+            from .agent.knowledge import load_fines_policy
+            fines = load_fines_policy()
+            return f"{fines.get('bank', '')} {fines.get('nomor', '')} a.n. {fines.get('atas_nama', '')}".strip()
+        except Exception:
+            return "BCA 4731763318 a.n. Bertrand Immanuel Wijaya"
 
     # ── audit log ──────────────────────────────────────────────────────────
     @_serialized
@@ -463,6 +461,14 @@ class OutputGenerator:
         ensure_dir(self.audit_path.parent)
         with open(self.audit_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            from .memory_store import get_memory_store
+            get_memory_store().record_execution(
+                action=action, actor=actor, target=target, result=result,
+                rationale=rationale, extra=extra or {},
+            )
+        except Exception:
+            pass
         return entry
 
     @_serialized
@@ -507,6 +513,11 @@ class OutputGenerator:
         new_rows = self.write_verification(batch.results)
         violations = self.write_violations(batch.results)
         draft_path, entries = self.write_blast_draft(batch)
+        try:
+            from .memory_store import get_memory_store
+            get_memory_store().save_validation_batch(batch, actor=actor)
+        except Exception:
+            pass
         self.audit(
             action="validate",
             actor=actor,
@@ -516,7 +527,7 @@ class OutputGenerator:
                 f"{len(batch.exempt)} exempt"
             ),
             rationale=(
-                f"merged {'rulebase + blast_context' if batch.blast_context_used else 'rulebase only'}"
+                f"merged {'rules + blast_context' if batch.blast_context_used else 'rules only'}"
             ),
             rule_ids=sorted({check.check_id for r in batch.results for check in r.violations}),
             confidence=round(

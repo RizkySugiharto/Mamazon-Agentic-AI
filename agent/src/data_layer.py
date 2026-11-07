@@ -28,6 +28,7 @@ from .sheets_client import (
 from .utils import (
     best_name_match,
     extract_drive_file_id,
+    normalize_handle,
     normalize_name,
     normalize_sheet_name,
     parse_dt,
@@ -67,6 +68,10 @@ COLUMN_ALIASES: dict[str, set[str]] = {
     "pelanggaran": {"jenis pelanggaran", "pelanggaran", "violation"},
     "denda": {"denda", "fine", "total denda"},
     "evidence": {"evidence link", "link evidence", "link bukti"},
+    "discord_id": {
+        "discord user id", "discord id", "user id discord", "id discord",
+        "discord_id", "discord userid", "discord",
+    },
 }
 
 
@@ -163,6 +168,7 @@ class RosterEntry:
     nim: str = ""
     divisi: str = ""
     ig: str = ""
+    discord_id: str = ""
 
 
 @dataclass
@@ -298,7 +304,7 @@ class DataLayer:
                     )
                 else:
                     record[field_name] = _text(row, index)
-            record["_raw"] = [_text(row, i) for i in range(len(headers))]
+            record["_raw"] = [_text(row, i) for i in range(max(len(headers), len(row)))]
             output.append(record)
         return output
 
@@ -355,28 +361,26 @@ class DataLayer:
 
     # ── sheet -> task resolution ───────────────────────────────────────────
     def task_sheet_index(self) -> dict[str, str]:
-        """normalized(task.sheet) -> task id, from the rulebase."""
-        index: dict[str, str] = {}
-        for key in ("tugas_pp", "tugas_buzzer"):
-            for task in self.rulebase.get(key, []) or []:
-                sheet = task.get("sheet")
-                if sheet:
-                    index[normalize_sheet_name(sheet)] = task["id"]
-        return index
+        """normalized(task.sheet) -> task id, from markdown task catalog."""
+        try:
+            from .agent.knowledge import task_sheet_map
+            return task_sheet_map()
+        except Exception:
+            return {}
 
     def resolve_task(self, sheet_name: str) -> TaskResolution:
         resolution = TaskResolution(sheet_name=sheet_name, task_id=None)
         normalized = normalize_sheet_name(sheet_name)
 
-        rulebase_index = self.task_sheet_index()
-        if normalized in rulebase_index:
-            resolution.task_id = rulebase_index[normalized]
-            resolution.source = "rulebase"
+        rules_index = self.task_sheet_index()
+        if normalized in rules_index:
+            resolution.task_id = rules_index[normalized]
+            resolution.source = "rules"
         elif sheet_name in self.sheet_task_map:
             resolution.task_id = self.sheet_task_map[sheet_name]
             resolution.source = "config"
         else:
-            for key, task_id in rulebase_index.items():
+            for key, task_id in rules_index.items():
                 if sheet_similarity(sheet_name, key) >= 0.9:
                     resolution.task_id = task_id
                     resolution.source = "fuzzy"
@@ -392,7 +396,7 @@ class DataLayer:
 
         if not resolution.task_id:
             resolution.warnings.append(
-                f"No rulebase task matched sheet '{sheet_name}'. "
+                f"No task matched sheet '{sheet_name}'. "
                 "Validation will run with generic checks only."
             )
         return resolution
@@ -425,6 +429,13 @@ class DataLayer:
         return resolution
 
     # ── roster & registries ────────────────────────────────────────────────
+    def clear_cache(self) -> None:
+        self._cache.clear()
+        if hasattr(self.source, "invalidate"):
+            self.source.invalidate()
+        if hasattr(self.source, "close"):
+            self.source.close()
+
     def load_roster(self) -> list[RosterEntry]:
         sheet = self.find_sheet(config.ROSTER_SHEET, "roster", "roster panitia")
         if sheet is None:
@@ -434,15 +445,69 @@ class DataLayer:
             nama = record.get("nama", "")
             if not nama:
                 continue
+            discord_id = record.get("discord_id", "")
+            if not discord_id and len(record.get("_raw", [])) > 4:
+                discord_id = record["_raw"][4]
+            discord_id = re.sub(r"[<@!>]", "", str(discord_id)).strip()
             entries.append(
                 RosterEntry(
                     nama=nama,
                     nim=record.get("nim", ""),
                     divisi=record.get("divisi", ""),
                     ig=record.get("ig", ""),
+                    discord_id=discord_id,
                 )
             )
         return entries
+
+    def update_roster_discord(self, target_nama: str, discord_id: str) -> tuple[RosterEntry, str]:
+        """Update or clear Column E (Discord User ID) for target panitia in Roster Panitia."""
+        sheet = self.find_sheet(config.ROSTER_SHEET, "roster", "roster panitia")
+        if sheet is None:
+            raise ValueError(f"Sheet '{config.ROSTER_SHEET}' tidak ditemukan.")
+
+        headers, _ = self.read_rows(sheet)
+        mapping = map_headers(headers)
+        discord_col = mapping.get("discord_id", 4) + 1  # 1-based, default col E (5)
+        nama_col = mapping.get("nama", 0)
+
+        entry, score = self.find_person(target_nama)
+        if entry is None or score < 0.8:
+            raise ValueError(f"Panitia '{target_nama}' tidak ditemukan di roster.")
+
+        all_rows = self.source.rows(sheet)
+        target_row_num = None
+        for row_idx, r in enumerate(all_rows, start=1):
+            cell_nama = _text(r, nama_col).strip()
+            if cell_nama.casefold() == entry.nama.strip().casefold():
+                target_row_num = row_idx
+                break
+
+        if target_row_num is None:
+            raise ValueError(f"Baris untuk '{entry.nama}' tidak ditemukan di sheet '{sheet}'.")
+
+        clean_id = re.sub(r"[<@!>]", "", str(discord_id)).strip()
+        old_id = entry.discord_id
+        self.source.update_cell(sheet, target_row_num, discord_col, clean_id)
+        self.clear_cache()
+        entry.discord_id = clean_id
+        return entry, old_id
+
+    def resolve_discord_user(self, discord_id: str | int) -> RosterEntry | None:
+        """Resolve Discord user ID to RosterEntry using Column E, falling back to DISCORD_MEMBER_MAP."""
+        uid = re.sub(r"[<@!>]", "", str(discord_id)).strip()
+        if not uid:
+            return None
+        roster = self.load_roster()
+        for entry in roster:
+            if entry.discord_id and entry.discord_id == uid:
+                return entry
+        fallback_name = config.DISCORD_MEMBER_MAP.get(uid, "")
+        if fallback_name:
+            for entry in roster:
+                if entry.nama.strip().casefold() == fallback_name.strip().casefold():
+                    return entry
+        return None
 
     def find_person(self, query: str, threshold: float = 0.82):
         """Return (RosterEntry, score) for the closest roster match."""
@@ -475,7 +540,137 @@ class DataLayer:
                         catatan=record.get("catatan_validasi", ""),
                     )
                 )
-        return apply_angel_overrides(entries)
+        return entries
+
+    def add_angel_card(
+        self,
+        nama: str,
+        divisi: str = "",
+        tanggal_beli: datetime | None = None,
+        status: str = "ACTIVE",
+        bukti: str = "",
+        catatan: str = "",
+    ) -> None:
+        sheet = self.find_sheet(config.ANGEL_CARD_SHEET, "angel card", "angel")
+        if not sheet:
+            raise SheetSourceError(f"Tab '{config.ANGEL_CARD_SHEET}' tidak ditemukan di spreadsheet.")
+
+        all_rows = self.source.rows(sheet)
+        if not all_rows:
+            headers = ["Nama Lengkap", "Divisi", "Status Angel Card", "Tanggal Pembelian", "Bukti Transfer", "Catatan Validasi"]
+            header_index = 0
+            data_rows = []
+        else:
+            header_index = 0
+            best_hits = -1
+            for index, row in enumerate(all_rows[:5]):
+                hits = len(map_headers(row))
+                if hits > best_hits:
+                    best_hits, header_index = hits, index
+            headers = [str(h) if h is not None else "" for h in all_rows[header_index]]
+            data_rows = all_rows[header_index + 1 :]
+
+        mapping = map_headers(headers)
+        if "nama" not in mapping:
+            raise SheetSourceError(f"Kolom Nama tidak ditemukan di sheet '{sheet}'.")
+
+        target_key = normalize_name(nama)
+        existing_idx = None
+        for idx, row in enumerate(data_rows):
+            if normalize_name(_text(row, mapping["nama"])) == target_key:
+                existing_idx = idx
+                break
+
+        date_str = tanggal_beli.strftime("%Y-%m-%d") if tanggal_beli else ""
+
+        if existing_idx is not None:
+            row_num = header_index + 2 + existing_idx
+            if "status" in mapping:
+                self.source.update_cell(sheet, row_num, mapping["status"] + 1, status)
+            if "tanggal_beli" in mapping and date_str:
+                self.source.update_cell(sheet, row_num, mapping["tanggal_beli"] + 1, date_str)
+            if "divisi" in mapping and divisi:
+                self.source.update_cell(sheet, row_num, mapping["divisi"] + 1, divisi)
+            if "catatan_validasi" in mapping and catatan:
+                self.source.update_cell(sheet, row_num, mapping["catatan_validasi"] + 1, catatan)
+        else:
+            row_values = ["" for _ in headers]
+            row_values[mapping["nama"]] = nama
+            if "divisi" in mapping:
+                row_values[mapping["divisi"]] = divisi
+            if "status" in mapping:
+                row_values[mapping["status"]] = status
+            if "tanggal_beli" in mapping:
+                row_values[mapping["tanggal_beli"]] = date_str
+            if "bukti_transfer" in mapping:
+                row_values[mapping["bukti_transfer"]] = bukti
+            if "catatan_validasi" in mapping:
+                row_values[mapping["catatan_validasi"]] = catatan
+            self.source.append_row(sheet, row_values)
+
+        self.clear_cache()
+
+    def remove_angel_card(self, nama: str, catatan: str = "dihapus via Discord") -> bool:
+        sheet = self.find_sheet(config.ANGEL_CARD_SHEET, "angel card", "angel")
+        if not sheet:
+            raise SheetSourceError(f"Tab '{config.ANGEL_CARD_SHEET}' tidak ditemukan di spreadsheet.")
+
+        all_rows = self.source.rows(sheet)
+        if not all_rows:
+            return False
+
+        header_index = 0
+        best_hits = -1
+        for index, row in enumerate(all_rows[:5]):
+            hits = len(map_headers(row))
+            if hits > best_hits:
+                best_hits, header_index = hits, index
+        headers = [str(h) if h is not None else "" for h in all_rows[header_index]]
+        data_rows = all_rows[header_index + 1 :]
+        mapping = map_headers(headers)
+
+        if "nama" not in mapping or "status" not in mapping:
+            raise SheetSourceError("Kolom Nama atau Status tidak ditemukan di sheet Angel Card.")
+
+        target_key = normalize_name(nama)
+        for idx, row in enumerate(data_rows):
+            if normalize_name(_text(row, mapping["nama"])) == target_key:
+                row_num = header_index + 2 + idx
+                self.source.update_cell(sheet, row_num, mapping["status"] + 1, "INACTIVE")
+                if "catatan_validasi" in mapping:
+                    existing = _text(row, mapping["catatan_validasi"])
+                    new_note = f"{existing}; {catatan}".strip("; ")
+                    self.source.update_cell(sheet, row_num, mapping["catatan_validasi"] + 1, new_note)
+                self.clear_cache()
+                return True
+        return False
+
+    def append_bukti_tambahan(self, entry: dict[str, Any]) -> None:
+        sheet = self.find_sheet(config.BUKTI_TAMBAHAN_SHEET, "bukti tambahan")
+        if not sheet:
+            return
+        headers, _ = self.read_rows(sheet)
+        mapping = map_headers(headers)
+        row_values = ["" for _ in headers]
+        if "timestamp" in mapping:
+            ts = entry.get("timestamp")
+            if isinstance(ts, datetime):
+                row_values[mapping["timestamp"]] = ts.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                row_values[mapping["timestamp"]] = str(ts or "")
+        if "submission" in mapping:
+            row_values[mapping["submission"]] = entry.get("submission", "")
+        if "ig" in mapping:
+            row_values[mapping["ig"]] = entry.get("ig", "")
+        if "deskripsi" in mapping:
+            row_values[mapping["deskripsi"]] = entry.get("deskripsi", "")
+        if "link" in mapping:
+            row_values[mapping["link"]] = entry.get("link", "")
+        if "pj" in mapping:
+            row_values[mapping["pj"]] = entry.get("pj", "")
+
+        self.source.append_row(sheet, row_values)
+        self.clear_cache()
 
     def load_bukti_tambahan(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -495,11 +690,15 @@ class DataLayer:
                     }
                 )
 
-        # Entries uploaded through Discord live in an append-only JSONL file.
+        # Entries uploaded through Discord live in an append-only JSONL file as backup.
         log_path = config.OUTPUT_DIR / "bukti_tambahan.jsonl"
         if log_path.exists():
             import json as _json
 
+            seen_keys = {
+                (r.get("submission", ""), normalize_handle(r.get("ig", "")), r.get("link", ""))
+                for r in rows
+            }
             try:
                 with open(log_path, encoding="utf-8") as handle:
                     for line in handle:
@@ -510,6 +709,10 @@ class DataLayer:
                             entry = _json.loads(line)
                         except _json.JSONDecodeError:
                             continue
+                        key = (entry.get("submission", ""), normalize_handle(entry.get("ig", "")), entry.get("link", ""))
+                        if key in seen_keys:
+                            continue
+                        seen_keys.add(key)
                         rows.append(
                             {
                                 "timestamp": parse_dt(entry.get("timestamp")),
