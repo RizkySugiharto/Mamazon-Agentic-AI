@@ -107,24 +107,92 @@ uv run python -m src.main vision-status --test-image   # send smoke-test image t
 
 ---
 
-## Agentic chat & knowledge base
+## Agentic RAG Architecture & Orchestration
 
-`#ai-chat` features an agentic workflow powered by LangChain and LangGraph:
+The `#ai-chat` conversational interface is built as a stateful, cyclical **Agentic Retrieval-Augmented Generation (RAG)** pipeline orchestrated via [LangGraph](https://github.com/langchain-ai/langgraph), [LangChain](https://github.com/langchain-ai/langchain), and an embedded, serverless [`zvec`](https://github.com/alibaba/zvec) vector store.
 
-- **Local Vector Store (`zvec`)**: Embedded vector database with `fastembed` (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`). No external database server required.
-- **Knowledge Base**: Indexed from committee rules (`agent/data/rules/agent_rules.md`) and task definitions.
-- **Persistent Memory**: SQLite conversation checkpointing (`agent/output/persistent_memory.sqlite`) and explicit member memory (`agent/output/chat_memory.json`).
-- **Speech-to-Text**: Voice notes (`.ogg`, `.mp3`, `.m4a`, `.wav`) sent in `#ai-chat` are transcribed via Whisper and processed directly.
-- **Bounded Tool Calling**: Safe AST-evaluated arithmetic (`hitung`), local rule search (`cari aturan`), member memory (`ingat`/`catat`/`recall`/`lupa`), web search (`cari web`), web scraper, and MCP client integration.
-- **Confirmed Execution**: Mutating operations (`validate`, `blast`, `add-angel`, `remove-angel`, `scan-blast`, `hold-blast`, `release-blast`) generate interactive Discord confirmation buttons with strict role checks and audit logging.
+### Orchestration Graph
+
+```
+[User Input (Text / Voice)] ──▶ [Whisper STT (9Router)]
+                                     │
+┌────────────────────────────────────┴────────────────────────────────────┐
+│                    LangGraph Stateful Execution Loop                    │
+│                                                                         │
+│   START ──▶ [ guard ] ────── blocked? ──────▶ [ respond ] ──▶ END       │
+│                │                                   ▲                    │
+│             passed                                 │                    │
+│                ▼                                   │                    │
+│          [ retrieve ]                              │                    │
+│                │                                   │                    │
+│        (zvec embeddings)                           │                    │
+│                ▼                                   │                    │
+│          ┌─▶ [ agent ] ──── final answer ──────────┘                    │
+│          │     ▲   │                                                    │
+│          │     │   └── tool call ──┐                                    │
+│          │     └───────────────────┴───▶ [ tools ] (role-gated sandbox) │
+└──────────┼──────────────────────────────────────────────────────────────┘
+           ▼
+[Checkpointer] ──▶ SqliteCheckpointSaver (`agent/output/persistent_memory.sqlite`)
+```
+
+### Graph Nodes & State Lifecycle
+
+Execution state (`AgentState`) travels through specialized, isolated nodes:
+
+1. **`guard` (Boundary & Scope Control)**:
+   - Evaluates incoming prompts against hard boundaries (developer-only rule modifications, out-of-scope discussions, direct mutating commands).
+   - Injects natural guidance dynamically without consuming model inference tokens when refusing invalid attempts.
+2. **`retrieve` (Context Augmentation via Local RAG)**:
+   - Performs dense semantic vector search against the local `zvec` collection.
+   - Extracts relevant rules, check specs (C1–C10 / B1–B7), and task requirements above the score floor (`CHAT_AGENT_MIN_SCORE = 0.45`).
+3. **`agent` (ReAct Reasoning Engine)**:
+   - Interacts with the active 9Router model via dynamic tool binding (`bind_tools`).
+   - Autonomously determines whether to synthesize an immediate response or request domain tool execution.
+4. **`tools` (Role-Gated Tool Sandbox)**:
+   - Dispatches read-only and analytical tools with caller role verification (`@BPH`, `@koor-spade`, `@spade`, `@panitia`).
+   - Returns structured `ToolMessage` outputs back to the agent reasoning cycle.
+   - Bounded by `CHAT_AGENT_MAX_STEPS` (default: 6) to eliminate infinite tool loops.
+5. **`respond` (Grounding & Action Staging)**:
+   - Validates outputs against hallucination filters (`_assert_grounded_output`).
+   - For mutating actions (`validate`, `blast`, `add-angel`, etc.), formats an interactive **Discord confirmation button view** (`pending_action`) instead of executing side effects unconfirmed.
+
+### Knowledge Retrieval Engine (`zvec` + FastEmbed)
+
+- **Zero-Daemon Vector Storage**: Embedded `zvec` engine operates in-process with C++ performance. No external database servers or Docker containers required.
+- **Local ONNX Embeddings**: Vectorized via `fastembed` using `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dimensional dense vectors with L2 normalization for exact cosine similarity).
+- **Corpus & Automated Hot-Reload**: Ingests Markdown sources (`agent/data/rules/agent_rules.md`, `pp_tasks.md`, `buzzer_tasks.md`). Evaluates a SHA-256 fingerprint on boot and automatically triggers hot re-indexing on file modification (`KB_REBUILD_ON_CHANGE=true`).
+- **Score Gating**: Dense similarity scores are calibrated (on-topic rules ~0.70–0.80, off-topic noise ~0.37) with a hard cutoff to prevent out-of-distribution hallucinations.
 
 Knowledge base commands:
 
 ```bash
-uv run python -m src.main kb-build     # build/refresh vector index from markdown rules
-uv run python -m src.main kb-status    # verify index doc counts and freshness
-uv run python -m src.main kb-search "<query>"  # test hybrid vector + FTS retrieval
+uv run python -m src.main kb-build     # build/rebuild local vector index from markdown rules
+uv run python -m src.main kb-status    # report vector index document counts and freshness
+uv run python -m src.main kb-search "<query>"  # test hybrid vector retrieval with score ranking
 ```
+
+### Multi-Tier Memory & Multi-Modal Processing
+
+- **Session Checkpointing**: Backed by `SqliteCheckpointSaver` (`persistent_memory.sqlite`), isolating conversation threads by guild, channel, and member ID with multi-turn context retention.
+- **Explicit Long-Term Memory**: Per-member memory store (`agent/output/chat_memory.json`) managed via explicit user instructions (`ingat <fakta>`, `catat <fakta>`, `recall`, `lupa semua`).
+- **Multi-Modal Voice Ingestion**: Discord audio attachments (`.ogg`, `.mp3`, `.m4a`, `.wav`) are intercepted, downloaded to temporary storage, and transcribed via 9Router Groq Whisper (`whisper-large-v3-turbo`) before injection into the graph state.
+
+### Bounded Tool Sandbox
+
+Chat agents operate under strict non-destructive constraints (no arbitrary code execution, no shell access, no direct file writes):
+
+| Tool | Capability | Access Control |
+| --- | --- | --- |
+| `hitung` | Safe arithmetic evaluator using AST whitelisting (no `eval`) | All members |
+| `cari aturan` | Exact and semantic rule lookup across the committee rulebase | All members |
+| `ingat` / `recall` / `forget` | User-scoped explicit fact persistence | Calling member only |
+| `denda panitia` | Fine totals and per-task infractions | Roster-bound panitia (self only) / Privileged (all) |
+| `ketentuan tugas` | Task specifications, deadlines, hashtags, tags, and media links | All members |
+| `angel card` | Angel Card registry lookup and exemption checks | All members |
+| `audit log` | Tail of system validation events and administrative decisions | Privileged roles |
+| `cari web` | External web search (requires `WEB_SEARCH_URL`) | Privileged roles |
+| `pending_action` | Action planner with interactive Discord button confirmation | Role-gated confirmation |
 
 ---
 
