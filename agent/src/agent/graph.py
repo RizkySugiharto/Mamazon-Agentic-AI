@@ -66,6 +66,9 @@ class DiscordAgentContext:
     runner: Any = None
     session: Any = None
     provider: str | None = None
+    is_voice: bool = False
+    voice_transcript: str = ""
+    voice_detection_enabled: bool = True
 
 
 def _get_agent_rules_text() -> str:
@@ -96,6 +99,9 @@ class AgentState(TypedDict, total=False):
     refusal: str
     error: str
     steps: int
+    is_voice: bool
+    voice_transcript: str
+    voice_detection_enabled: bool
 
 
 def _merge(left: list[str], right: list[str]) -> list[str]:
@@ -483,6 +489,21 @@ class AgentGraph:
             f"- When answering about ketentuan, rules, or requirements for PP or Buzzer tasks (both specific tasks like PP-01..PP-06, BZ-01..BZ-07 and general rules):",
             f"  ALWAYS mention the task channel {channel_mention(config.DISCORD_BLAST_TUGAS_CHANNEL_ID)} in your response as the place where coordinators blast official briefs, captions, Drive links, and deadlines.",
         ]
+        voice_status = "AKTIF" if state.get("voice_detection_enabled", config.VOICE_DETECTION_ENABLED) else "NONAKTIF"
+        blocks.extend([
+            "",
+            "FITUR VOICE NOTE / AUDIO DETECTION:",
+            f"- Status penerimaan voice note / pesan suara: {voice_status}.",
+            f"  Jika pengguna bertanya apakah bot bisa mendengar/menerima voice note, jelaskan dengan ramah bahwa fitur saat ini sedang {voice_status}.",
+        ])
+        if state.get("is_voice"):
+            blocks.extend([
+                "",
+                "CATATAN MASUKAN SUARA (VOICE NOTE):",
+                "- Pesan pengguna berasal dari transkripsi rekaman suara (Groq Whisper via 9Router).",
+                "- Maklumi jika ada sedikit ketidaktepatan ejaan fonetis untuk kode tugas, nama sheet, atau istilah teknis (misal 'buser' untuk 'buzzer', 'pepe' untuk 'PP').",
+                "- Tafsirkan maksud pengguna secara wajar berdasarkan konteks SPADE.",
+            ])
         guidance = state.get("boundary_guidance")
         if guidance:
             blocks.append(f"\nPANDUAN KHUSUS UNTUK PERTANYAAN INI:\n{guidance}")
@@ -536,6 +557,9 @@ class AgentGraph:
             "refusal": "",
             "error": "",
             "steps": 0,
+            "is_voice": getattr(ctx, "is_voice", False),
+            "voice_transcript": getattr(ctx, "voice_transcript", ""),
+            "voice_detection_enabled": getattr(ctx, "voice_detection_enabled", config.VOICE_DETECTION_ENABLED),
         }
         thread_id = (
             f"{ctx.channel_id}:{ctx.user_id}"

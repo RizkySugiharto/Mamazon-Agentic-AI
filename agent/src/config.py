@@ -140,6 +140,11 @@ NINEROUTER_APP_NAME = _env("NINEROUTER_APP_NAME", "Mamazon Spade Agent")
 NINEROUTER_USER_AGENT = _env(
     "NINEROUTER_USER_AGENT", "MamazonSpadeAgent/1.0 (+9Router)"
 )
+# Audio transcription model routed through 9Router (Groq Whisper)
+NINEROUTER_WHISPER_MODEL = _env("NINEROUTER_WHISPER_MODEL", "groq/whisper-large-v3-turbo")
+NINEROUTER_WHISPER_TIMEOUT = max(5, _env_int("NINEROUTER_WHISPER_TIMEOUT", 60))
+# Feature toggle: accept and parse voice notes / audio files in Discord #ai-chat
+VOICE_DETECTION_ENABLED = _env_bool("VOICE_DETECTION_ENABLED", True)
 
 # ─── Bounded agent tools (no arbitrary code execution) ─────────────────────
 CHAT_TOOLS_ENABLED = _env_bool("CHAT_TOOLS_ENABLED", True)
@@ -542,6 +547,8 @@ def ai_provider_status() -> dict[str, object]:
         "api_base_url": effective_ninerouter_base_url(),
         "api_user_agent": NINEROUTER_USER_AGENT,
         "api_key_set": bool(NINEROUTER_API_KEY),
+        "whisper_model": NINEROUTER_WHISPER_MODEL,
+        "voice_detection_enabled": VOICE_DETECTION_ENABLED,
         "offline": USE_MOCK_VISION,
         "issues": validate_ai_config(),
         "warnings": ai_provider_warnings(),

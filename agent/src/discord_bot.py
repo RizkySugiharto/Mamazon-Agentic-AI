@@ -342,6 +342,8 @@ class MamazonBot(commands.Bot):
         self._chat_busy: set[tuple] = set()
         self._blast_action_lock = asyncio.Lock()
         self._blast_sending: set[str] = set()
+        from .voice_transcriber import VoiceTranscriber
+        self.voice_transcriber = VoiceTranscriber()
         # Populated eagerly so /validate autocomplete works on the first keystroke.
         try:
             self._sheet_names: list[str] = self.data.submission_sheets()
@@ -2222,6 +2224,26 @@ class MamazonBot(commands.Bot):
                 "Perintah tidak dikenali; aksi dibatalkan.", ephemeral=True
             )
 
+    AUDIO_EXTENSIONS = {".ogg", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".webm", ".oga"}
+
+    @classmethod
+    def is_audio_attachment(cls, attachment: discord.Attachment) -> bool:
+        ct = (getattr(attachment, "content_type", "") or "").lower()
+        if ct.startswith("audio/"):
+            return True
+        filename = (getattr(attachment, "filename", "") or "").lower()
+        return any(filename.endswith(ext) for ext in cls.AUDIO_EXTENSIONS)
+
+    @classmethod
+    def get_audio_attachment(cls, message: discord.Message) -> discord.Attachment | None:
+        is_voice = getattr(message.flags, "voice", False) or (
+            callable(getattr(message, "is_voice_message", None)) and message.is_voice_message()
+        )
+        for att in getattr(message, "attachments", []):
+            if is_voice or cls.is_audio_attachment(att):
+                return att
+        return None
+
     async def _handle_chat(self, message: discord.Message) -> None:
         if not self.has_permission(message.author, "validate"):
             return
@@ -2238,6 +2260,101 @@ class MamazonBot(commands.Bot):
             channel_id = str(message.channel.id)
             user_id = str(message.author.id)
 
+            audio_att = self.get_audio_attachment(message)
+            transcript = ""
+            if audio_att:
+                if not config.VOICE_DETECTION_ENABLED:
+                    await message.reply(
+                        "Fitur pesan suara (voice note) saat ini sedang dinonaktifkan. Silakan kirim pertanyaanmu lewat teks ya.",
+                        mention_author=False,
+                    )
+                    return
+
+                if not config.NINEROUTER_API_KEY:
+                    await message.reply(
+                        "Aku mendeteksi pesan suara, tapi gateway 9Router belum dikonfigurasi (`NINEROUTER_API_KEY` belum diset). "
+                        "Silakan gunakan pesan teks ya.",
+                        mention_author=False,
+                    )
+                    return
+
+                size = getattr(audio_att, "size", 0)
+                if size > 25 * 1024 * 1024:
+                    await message.reply(
+                        "Ukuran rekaman suara melebihi batas 25MB. Coba kirim rekaman yang lebih singkat ya.",
+                        mention_author=False,
+                    )
+                    return
+
+                try:
+                    from .voice_transcriber import (
+                        TranscriptionConfigError,
+                        TranscriptionEmptyError,
+                        TranscriptionRateLimitError,
+                        VoiceDisabledError,
+                    )
+                    async with message.channel.typing():
+                        audio_bytes = await audio_att.read()
+                        if not audio_bytes:
+                            await message.reply(
+                                "File rekaman suara kosong atau tidak dapat diunduh. Coba kirim ulang ya.",
+                                mention_author=False,
+                            )
+                            return
+                        transcript = await asyncio.to_thread(
+                            self.voice_transcriber.transcribe_bytes,
+                            audio_bytes,
+                            filename=audio_att.filename or "voice-message.ogg",
+                            content_type=audio_att.content_type or "audio/ogg",
+                        )
+                except TranscriptionEmptyError:
+                    await message.reply(
+                        "Pesan suara tidak terdengar jelas atau tidak ada ucapan terdeteksi. Boleh diulang atau diketik lewat teks ya?",
+                        mention_author=False,
+                    )
+                    return
+                except TranscriptionRateLimitError:
+                    await message.reply(
+                        "Layanan transkripsi suara sedang sibuk (rate limit). Coba lagi sebentar lagi atau ketik lewat teks ya.",
+                        mention_author=False,
+                    )
+                    return
+                except VoiceDisabledError:
+                    await message.reply(
+                        "Fitur pesan suara (voice note) saat ini sedang dinonaktifkan. Silakan kirim pertanyaanmu lewat teks ya.",
+                        mention_author=False,
+                    )
+                    return
+                except TranscriptionConfigError:
+                    await message.reply(
+                        "Konfigurasi transkripsi suara bermasalah (`NINEROUTER_API_KEY` belum diset). Silakan gunakan pesan teks.",
+                        mention_author=False,
+                    )
+                    return
+                except Exception as exc:
+                    logger.warning("Voice transcription failed: %s", exc)
+                    await message.reply(
+                        "Maaf, terjadi kendala saat memproses pesan suaramu. Coba kirim lewat teks ya.",
+                        mention_author=False,
+                    )
+                    return
+
+                if transcript:
+                    content = f"{content} {transcript}".strip() if content else transcript
+                    try:
+                        self.outputs.audit(
+                            action="voice_transcription",
+                            actor=str(message.author),
+                            target=audio_att.filename or "voice-note",
+                            result="transcribed",
+                            rationale=truncate(transcript, 100),
+                        )
+                    except Exception:
+                        pass
+
+            if not content:
+                return
+
             try:
                 from .agent.graph import DiscordAgentContext
 
@@ -2248,6 +2365,9 @@ class MamazonBot(commands.Bot):
                     actor=str(message.author),
                     member=message.author,
                     validator=self.validator,
+                    is_voice=bool(transcript),
+                    voice_transcript=transcript,
+                    voice_detection_enabled=config.VOICE_DETECTION_ENABLED,
                 )
             except Exception:
                 agent_ctx = None
@@ -2272,6 +2392,8 @@ class MamazonBot(commands.Bot):
 
             warnings = getattr(self.data.source, "freshness_warnings", [])
             formatted = format_discord_message(answer.text)
+            if transcript:
+                formatted = f"🎙️ *\"{transcript}\"*\n\n{formatted}"
             text = formatted + ("\n\nCatatan data: " + "\n".join(warnings) if warnings else "")
             pending = answer.pending_action
             if pending:
