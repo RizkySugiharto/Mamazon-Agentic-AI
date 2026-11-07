@@ -18,6 +18,7 @@ agent/output/*.csv
 agent/output/*.jsonl
 agent/output/*.json
 agent/output/*.md
+agent/output/*.sqlite
 agent/output/blasts/
 agent/tmp/
 agent/logs/
