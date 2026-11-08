@@ -549,6 +549,115 @@ def extract_hashtags(text: str | None) -> list[str]:
     return seen
 
 
+# ─── Division aliases & hashtag matching ─────────────────────────────────────
+DIVISION_ALIASES: dict[str, list[str]] = {
+    "fletch": ["fletch", "perlengkapan", "logistik", "perkap"],
+    "dupin": ["dupin", "visual", "desain", "design"],
+    "columbo": ["columbo", "dokumentasi", "dokum", "dokumen"],
+    "marple": ["marple", "maple", "dekorasi", "dekor", "deko"],
+    "marlowe": ["marlowe", "publicrelations", "public_relations", "public relation", "pr", "humas"],
+    "kindaichi": ["kindaichi", "keamanan", "security", "sec"],
+    "conan": ["conan", "acara", "event"],
+    "spade": ["spade", "freshmoney", "fresh_money", "fresh money", "fm", "dana"],
+}
+
+DIVISION_PRIMARY_NAME: dict[str, str] = {
+    "fletch": "Fletch",
+    "dupin": "Dupin",
+    "columbo": "Columbo",
+    "marple": "Marple",
+    "marlowe": "Marlowe",
+    "kindaichi": "Kindaichi",
+    "conan": "Conan",
+    "spade": "Spade",
+}
+
+_DIVISION_PLACEHOLDER_RE = re.compile(
+    r"^(#.*?)[_\{<\[]?(?:divisi|division)[\]\}>]?$", re.IGNORECASE
+)
+
+
+def resolve_division_key(divisi: str | None) -> str | None:
+    """Map raw division string (e.g. 'Marple (Dekorasi)', 'Maple', 'Acara') to canonical key."""
+    if not divisi:
+        return None
+    raw = str(divisi).lower()
+    cleaned = re.sub(r"[^a-z0-9]", "", raw)
+    for key, aliases in DIVISION_ALIASES.items():
+        for alias in aliases:
+            alias_clean = re.sub(r"[^a-z0-9]", "", alias)
+            if alias_clean and alias_clean == cleaned:
+                return key
+    tokens = re.findall(r"[a-z0-9]+", raw)
+    for token in tokens:
+        for key, aliases in DIVISION_ALIASES.items():
+            for alias in aliases:
+                alias_clean = re.sub(r"[^a-z0-9]", "", alias)
+                if token == alias_clean:
+                    return key
+    return None
+
+
+def is_division_placeholder_hashtag(tag: str | None) -> bool:
+    """Return True if tag matches a division placeholder like #PPHorizon_divisi."""
+    if not tag:
+        return False
+    return bool(_DIVISION_PLACEHOLDER_RE.match(str(tag).strip()))
+
+
+def get_division_hashtag_prefix(tag: str | None) -> str | None:
+    """Extract '#PPHorizon' from '#PPHorizon_divisi'."""
+    if not tag:
+        return None
+    match = _DIVISION_PLACEHOLDER_RE.match(str(tag).strip())
+    return match.group(1) if match else None
+
+
+def adapt_hashtags_for_division(hashtags: Sequence[str], divisi: str | None) -> list[str]:
+    """Substitute division placeholder with member's primary division name."""
+    div_key = resolve_division_key(divisi)
+    primary = DIVISION_PRIMARY_NAME.get(div_key, "") if div_key else ""
+    adapted: list[str] = []
+    for tag in hashtags:
+        if is_division_placeholder_hashtag(tag) and primary:
+            prefix = get_division_hashtag_prefix(tag)
+            adapted.append(f"{prefix}_{primary}")
+        else:
+            adapted.append(tag)
+    return adapted
+
+
+def match_hashtag(required_tag: str, present_tags: set[str], divisi: str | None = None) -> bool:
+    """Match required hashtag against present hashtags, supporting division substitution."""
+    req_lower = required_tag.strip().lower()
+    norm_present = {t.strip().lower() for t in present_tags if t}
+    if req_lower in norm_present:
+        return True
+
+    if not is_division_placeholder_hashtag(required_tag):
+        return False
+
+    prefix = (get_division_hashtag_prefix(required_tag) or "").lower()
+    div_key = resolve_division_key(divisi)
+
+    if div_key and div_key in DIVISION_ALIASES:
+        suffixes = DIVISION_ALIASES[div_key]
+    else:
+        suffixes = [alias for aliases in DIVISION_ALIASES.values() for alias in aliases]
+
+    suffixes = list(suffixes) + ["divisi"]
+
+    for suffix in suffixes:
+        clean_suffix = re.sub(r"[^a-z0-9]", "", suffix.lower())
+        candidates = {
+            f"{prefix}_{clean_suffix}",
+            f"{prefix}{clean_suffix}",
+        }
+        if any(c in norm_present for c in candidates):
+            return True
+    return False
+
+
 def extract_mentions(text: str | None) -> list[str]:
     if not text:
         return []

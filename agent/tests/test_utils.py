@@ -7,18 +7,23 @@ from datetime import datetime
 import pytest
 
 from src.utils import (
+    adapt_hashtags_for_division,
     caption_similarity,
     day_name_matches,
     extract_drive_file_id,
     extract_hashtags,
     extract_mentions,
     format_rupiah,
+    get_division_hashtag_prefix,
+    is_division_placeholder_hashtag,
     is_emoji_only,
+    match_hashtag,
     name_similarity,
     normalize_handle,
     normalize_sheet_name,
     parse_dt,
     parse_date_range,
+    resolve_division_key,
     sheet_similarity,
     split_links,
     word_count,
@@ -187,3 +192,40 @@ class TestTextHelpers:
     def test_format_rupiah(self):
         assert format_rupiah(15000) == "Rp 15.000"
         assert format_rupiah(0) == "Rp 0"
+
+    def test_resolve_division_key(self):
+        assert resolve_division_key("Marple (Dekorasi)") == "marple"
+        assert resolve_division_key("Maple") == "marple"
+        assert resolve_division_key("Dekorasi") == "marple"
+        assert resolve_division_key("Spade (Fresh Money)") == "spade"
+        assert resolve_division_key("Conan (Acara)") == "conan"
+        assert resolve_division_key("Kindaichi") == "kindaichi"
+        assert resolve_division_key("") is None
+        assert resolve_division_key(None) is None
+
+    def test_division_placeholder_detection(self):
+        assert is_division_placeholder_hashtag("#PPHorizon_divisi") is True
+        assert is_division_placeholder_hashtag("#PPHorizon_division") is True
+        assert is_division_placeholder_hashtag("#PPHorizon_<divisi>") is True
+        assert is_division_placeholder_hashtag("#PPHorizon") is False
+        assert is_division_placeholder_hashtag("#CaseOfTheUnseen") is False
+        assert get_division_hashtag_prefix("#PPHorizon_divisi") == "#PPHorizon"
+
+    def test_adapt_hashtags_for_division(self):
+        raw = ["#PPHorizon", "#PPHorizon_divisi", "#CaseOfTheUnseen"]
+        adapted = adapt_hashtags_for_division(raw, "Marple (Dekorasi)")
+        assert adapted == ["#PPHorizon", "#PPHorizon_Marple", "#CaseOfTheUnseen"]
+
+    def test_match_hashtag_exact_and_division(self):
+        present = {"#pphorizon", "#pphorizon_maple", "#caseoftheunseen"}
+        assert match_hashtag("#PPHorizon", present) is True
+        assert match_hashtag("#CaseOfTheUnseen", present) is True
+        # #PPHorizon_divisi matches member with division "Marple (Dekorasi)" posting #pphorizon_maple
+        assert match_hashtag("#PPHorizon_divisi", present, "Marple (Dekorasi)") is True
+        assert match_hashtag("#PPHorizon_divisi", present, "Maple") is True
+        # Fails for different division
+        assert match_hashtag("#PPHorizon_divisi", present, "Spade (Fresh Money)") is False
+        # Matches literal #pphorizon_divisi if posted
+        assert match_hashtag("#PPHorizon_divisi", {"#pphorizon_divisi"}, "Spade") is True
+        # Unrelated hashtag fails
+        assert match_hashtag("#jasacoding", present) is False

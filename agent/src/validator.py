@@ -66,6 +66,7 @@ from .agent.evaluator import (
 )
 from .agent import knowledge
 from .utils import (
+    adapt_hashtags_for_division,
     handle_similarity,
     normalize_handle,
     normalize_name,
@@ -314,6 +315,7 @@ class Validator:
         return resolution.resolved, resolution
 
     def _hints(self, submission: Submission, merged: MergedContext) -> VisionHints:
+        adapted_hashtags = adapt_hashtags_for_division(merged.hashtags, submission.divisi)
         return VisionHints(
             task_id=merged.task_id,
             task_type=merged.task_type,
@@ -323,7 +325,7 @@ class Validator:
             platforms=merged.platforms,
             caption_reference=merged.caption_reference,
             required_mentions=merged.tags,
-            required_hashtags=merged.hashtags,
+            required_hashtags=adapted_hashtags,
             jadwal_post=merged.jadwal_post,
             deadline=merged.deadline,
             target_url=merged.target_url,

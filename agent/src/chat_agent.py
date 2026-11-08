@@ -340,7 +340,10 @@ def _task_detail(engine: Any, task_id: str) -> str:
     if merged.tags:
         lines.append(f"Tags wajib: {', '.join(merged.tags)}")
     if merged.hashtags:
-        lines.append(f"Hashtag: {', '.join(merged.hashtags)}")
+        ht_text = f"Hashtag: {', '.join(merged.hashtags)}"
+        if any("_divisi" in h.lower() for h in merged.hashtags):
+            ht_text += " (placeholder '_divisi' diganti nama divisi masing-masing, misal #PPHorizon_Marple)"
+        lines.append(ht_text)
     if merged.caption_reference:
         lines.append(f"Caption: {truncate(merged.caption_reference, 200)}")
     for warning in merged.warnings:

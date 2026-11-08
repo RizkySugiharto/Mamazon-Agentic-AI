@@ -488,6 +488,10 @@ class AgentGraph:
             "KETENTUAN TUGAS PP & BUZZER (MANDATORY CHANNEL MENTION):",
             f"- When answering about ketentuan, rules, or requirements for PP or Buzzer tasks (both specific tasks like PP-01..PP-06, BZ-01..BZ-07 and general rules):",
             f"  ALWAYS mention the task channel {channel_mention(config.DISCORD_BLAST_TUGAS_CHANNEL_ID)} in your response as the place where coordinators blast official briefs, captions, Drive links, and deadlines.",
+            "",
+            "HASHTAG DIVISI (ATURAN C6):",
+            "- Ketentuan hashtag dengan placeholder divisi (seperti #PPHorizon_divisi) diisi menggunakan nama divisi masing-masing anggota (contoh: #PPHorizon_Marple atau variasi #PPHorizon_Maple / #PPHorizon_Dekorasi untuk divisi Marple/Dekorasi, #PPHorizon_Spade untuk Spade, #PPHorizon_Conan untuk Conan, dll.).",
+            "- Anggota yang mencantumkan hashtag divisi mereka sendiri adalah BENAR dan SAH, BUKAN pelanggaran C6, dan TIDAK boleh dikenakan denda C6.",
         ]
         voice_status = "AKTIF" if state.get("voice_detection_enabled", config.VOICE_DETECTION_ENABLED) else "NONAKTIF"
         blocks.extend([

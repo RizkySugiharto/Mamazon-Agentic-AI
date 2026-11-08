@@ -294,6 +294,14 @@ class TestDivisionFilter:
         batch = isolated_validator.validate("Submission")
         assert "Using quota fallback snapshot" in batch.warnings
 
+    def test_hints_adapt_division_hashtags(self, isolated_validator):
+        merged = isolated_validator.engine.merge.return_value
+        merged.hashtags = ["#PPHorizon", "#PPHorizon_divisi", "#CaseOfTheUnseen"]
+        sub = Submission(1, "Test User", divisi="Marple (Dekorasi)")
+        hints = isolated_validator._hints(sub, merged)
+        assert "#PPHorizon_Marple" in hints.required_hashtags
+        assert "#PPHorizon_divisi" not in hints.required_hashtags
+
 
 class TestCancellation:
     def test_cancelled_before_start_does_not_read_sources(self, isolated_validator, outputs):

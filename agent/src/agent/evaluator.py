@@ -28,14 +28,20 @@ from ..models import (
     VisionFacts,
 )
 from ..utils import (
+    DIVISION_PRIMARY_NAME,
     caption_similarity,
+    extract_hashtags,
     extract_mentions,
     format_rupiah,
+    get_division_hashtag_prefix,
     handle_similarity,
+    is_division_placeholder_hashtag,
+    match_hashtag,
     name_similarity,
     normalize_caption,
     normalize_handle,
     parse_dt,
+    resolve_division_key,
     truncate,
     unique,
     word_count,
@@ -441,10 +447,26 @@ def _eval_c6(sub: Submission, merged: MergedContext, facts: VisionFacts, story_n
         return _result("C6", CheckStatus.NOT_APPLICABLE, "Task tidak mendefinisikan hashtag wajib", confidence=facts.confidence)
     if not facts.hashtags and not facts.all_text():
         return _result("C6", CheckStatus.INCONCLUSIVE, "Hashtag tidak terbaca dari bukti", confidence=facts.confidence)
-    present = {tag.lower() for tag in facts.hashtags}
-    missing = [tag for tag in required if tag.lower() not in present]
+
+    extracted = extract_hashtags(facts.all_text())
+    present = {tag.lower() for tag in facts.hashtags} | {tag.lower() for tag in extracted}
+    if not present:
+        return _result("C6", CheckStatus.INCONCLUSIVE, "Hashtag tidak terbaca dari bukti", confidence=facts.confidence)
+
+    missing: list[str] = []
+    for tag in required:
+        if not match_hashtag(tag, present, sub.divisi):
+            if is_division_placeholder_hashtag(tag):
+                div_key = resolve_division_key(sub.divisi)
+                primary = DIVISION_PRIMARY_NAME.get(div_key, "") if div_key else ""
+                prefix = get_division_hashtag_prefix(tag) or tag
+                missing.append(f"{prefix}_{primary}" if primary else tag)
+            else:
+                missing.append(tag)
+
     if missing:
-        return _fail("C6", f"Hashtag kurang: {', '.join(missing)} ({len(present)}/{len(required)} ada)", sub, facts.confidence)
+        present_count = len(required) - len(missing)
+        return _fail("C6", f"Hashtag kurang: {', '.join(missing)} ({present_count}/{len(required)} ada)", sub, facts.confidence)
     return _result("C6", CheckStatus.PASS, f"Semua {len(required)} hashtag wajib ada", confidence=facts.confidence)
 
 

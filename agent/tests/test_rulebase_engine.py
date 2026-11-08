@@ -243,6 +243,56 @@ class TestPPChecks:
         )
         assert result.status == CheckStatus.PASS
 
+    def test_c6_division_placeholder_maple_pass(self, engine):
+        """Member in Marple/Dekorasi posting #PPHorizon_Maple satisfies #PPHorizon_divisi."""
+        merged = engine.merge("PP-03")
+        tags = [
+            "#PPHorizon_Maple" if tag.lower() == "#pphorizon_divisi" else tag
+            for tag in merged.hashtags
+        ]
+        sub = make_submission(divisi="Marple (Dekorasi)")
+        result = engine._check_c6(sub, merged, make_facts(hashtags=tags), None)
+        assert result.status == CheckStatus.PASS
+        assert result.denda == 0
+
+    def test_c6_division_placeholder_marple_pass(self, engine):
+        """Member in Marple/Dekorasi posting #PPHorizon_Marple satisfies #PPHorizon_divisi."""
+        merged = engine.merge("PP-03")
+        tags = [
+            "#PPHorizon_Marple" if tag.lower() == "#pphorizon_divisi" else tag
+            for tag in merged.hashtags
+        ]
+        sub = make_submission(divisi="Marple (Dekorasi)")
+        result = engine._check_c6(sub, merged, make_facts(hashtags=tags), None)
+        assert result.status == CheckStatus.PASS
+        assert result.denda == 0
+
+    def test_c6_division_placeholder_spade_pass(self, engine):
+        """Member in Spade posting #PPHorizon_Spade satisfies #PPHorizon_divisi."""
+        merged = engine.merge("PP-03")
+        tags = [
+            "#PPHorizon_Spade" if tag.lower() == "#pphorizon_divisi" else tag
+            for tag in merged.hashtags
+        ]
+        sub = make_submission(divisi="Spade (Fresh Money)")
+        result = engine._check_c6(sub, merged, make_facts(hashtags=tags), None)
+        assert result.status == CheckStatus.PASS
+        assert result.denda == 0
+
+    def test_c6_hashtag_in_comment_text_pass(self, engine):
+        """Hashtags in comment_text or caption_text are extracted and pass C6."""
+        merged = engine.merge("PP-03")
+        tags_str = " ".join([
+            "#PPHorizon_Maple" if tag.lower() == "#pphorizon_divisi" else tag
+            for tag in merged.hashtags
+        ])
+        sub = make_submission(divisi="Marple (Dekorasi)")
+        # Empty facts.hashtags, but present in comment_text
+        facts = make_facts(hashtags=[], comment_text=f"done post ya! {tags_str}")
+        result = engine._check_c6(sub, merged, facts, None)
+        assert result.status == CheckStatus.PASS
+        assert result.denda == 0
+
     def test_c7_story_expired(self, engine):
         result = engine._check_c7(
             make_submission(task_id="PP-07", sheet_name="PP Story 09 Oktober"),
